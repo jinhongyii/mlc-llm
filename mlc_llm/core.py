@@ -6,11 +6,18 @@ import pickle
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, Optional
 
-import mlc_llm
 import tvm
+import tvm.relax.backend.contrib.cublas as _
+from tvm import dlight as dl
+from tvm import relax
+from tvm.contrib.nvcc import parse_compute_version
+from tvm.relax.backend import get_patterns_with_prefix
+from tvm.relax.backend.contrib.cutlass import annotate_workspace
+
+import mlc_llm
 from mlc_llm import utils
-from mlc_llm.transform import rewrite_attention, fuse_split_rotary_embedding
 from mlc_llm.relax_model import (
+    chatglm,
     gpt_bigcode,
     gpt_neox,
     gptj,
@@ -18,15 +25,8 @@ from mlc_llm.relax_model import (
     minigpt,
     param_manager,
     rwkv,
-    chatglm,
 )
-
-from tvm import dlight as dl
-from tvm import relax
-from tvm.contrib.nvcc import parse_compute_version
-from tvm.relax.backend import get_patterns_with_prefix
-from tvm.relax.backend.contrib.cutlass import annotate_workspace
-import tvm.relax.backend.contrib.cublas as _
+from mlc_llm.transform import fuse_split_rotary_embedding, rewrite_attention
 
 
 @dataclass
@@ -211,6 +211,15 @@ class BuildArgs:
                 "projection between two attention layers are put into a graph."
             ),
             "action": "store_true",
+        },
+    )
+    num_shards: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Number of shards to split the model into in tensor parallelism multi-gpu "
+                "inference"
+            ),
         },
     )
 
@@ -533,6 +542,15 @@ def build_model_from_args(args: argparse.Namespace):
             "WARNING: q4f16_1 is preferred to q4f16_0, "
             "and it is highly recommended to use q4f16_1 instaed"
         )
+    if args.num_shards > 1:
+        if (args.build_model_only and args.convert_weight_only) or (
+            not args.build_model_only and not args.convert_weight_only
+        ):
+            raise ValueError(
+                "When num_shards > 1, precisely one of `build_model_only` and"
+                " `convert_weight_only` are expected to be set"
+            )
+
     os.makedirs(args.artifact_path, exist_ok=True)
     if args.debug_dump:
         os.makedirs(os.path.join(args.artifact_path, "debug"), exist_ok=True)

@@ -5,6 +5,7 @@ from typing import Any, List, Optional, Tuple
 import numpy as np
 import tvm
 from tvm import relax, te
+from tvm.relax.op import ccl
 from tvm.relax.testing import nn
 from tvm.script import relax as R
 
@@ -145,10 +146,15 @@ class LlamaMLP(nn.Module):
         if self.combine_matmul:
             self.gate_up_proj = Linear(hidden_size, 2 * intermediate_size, dtype=dtype, bias=False)
             self.down_proj = Linear(intermediate_size, hidden_size, dtype=dtype, bias=False)
+            self.gate_up_proj.weight.shard_dim = 0
+            self.down_proj.weight.shard_dim = 1
         else:
             self.gate_proj = Linear(hidden_size, intermediate_size, dtype=dtype, bias=False)
             self.down_proj = Linear(intermediate_size, hidden_size, dtype=dtype, bias=False)
             self.up_proj = Linear(hidden_size, intermediate_size, dtype=dtype, bias=False)
+            self.gate_proj.weight.shard_dim = 0
+            self.up_proj.weight.shard_dim = 0
+            self.down_proj.weight.shard_dim = 1
 
     def forward(self, x):
         if self.combine_matmul:
@@ -165,7 +171,9 @@ class LlamaMLP(nn.Module):
             gate_result = self.gate_proj(x)
             up_result = self.up_proj(x)
 
-        return self.down_proj(relax.op.nn.silu(gate_result) * up_result)
+        result = self.down_proj(relax.op.nn.silu(gate_result) * up_result)
+        result = nn.emit(ccl.allreduce(result, "sum"))
+        return result
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, offset: int = 0):
@@ -213,6 +221,7 @@ class LlamaAttention(nn.Module):
                 dtype=dtype,
                 bias=False,
             )
+            self.query_key_value_proj.weight.shard_dim = 0
         else:
             self.q_proj = Linear(
                 self.hidden_size,
@@ -232,8 +241,12 @@ class LlamaAttention(nn.Module):
                 dtype=dtype,
                 bias=False,
             )
+            self.q_proj.weight.shard_dim = 0
+            self.k_proj.weight.shard_dim = 0
+            self.v_proj.weight.shard_dim = 0
 
         self.o_proj = Linear(self.hidden_size, self.hidden_size, dtype=dtype, bias=False)
+        self.o_proj.weight.shard_dim = 0
 
     def forward(
         self,
@@ -390,6 +403,7 @@ class LlamaAttention(nn.Module):
         attn_output = reshape(attn_output, (bsz, q_len, self.hidden_size))
 
         attn_output = self.o_proj(attn_output)
+        attn_output = nn.emit(ccl.allreduce(attn_output, "sum"))
         return attn_output, ((None, None) if past_key_value is None else past_key_value)
 
 
@@ -529,6 +543,7 @@ class LlamaModel(nn.Module):
         all_seq_len_shape: relax.Expr,
         past_key_values: relax.Expr,
     ):
+        inputs = nn.emit(ccl.broadcast_from_worker0(inputs))
         if self.embed_tokens:
             inputs_embeds = self.embed_tokens(inputs)
         else:

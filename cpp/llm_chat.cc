@@ -14,7 +14,9 @@
 #include <tvm/runtime/ndarray.h>
 #include <tvm/runtime/registry.h>
 #include <tvm/runtime/relax_vm/memory_manager.h>
-
+#include <tvm/runtime/disco/session.h>
+#include <tvm/runtime/container/optional.h>
+#include <tvm/ir/attrs.h>
 #include <cctype>
 #include <chrono>
 #include <filesystem>
@@ -233,29 +235,44 @@ class LLMChat {
    * \param app_config_json The JSON string used to partially override the configuration loaded from
    * disk, default to empty string.
    */
-  void Reload(tvm::runtime::Module executable, String model_path, String app_config_json = "") {
+  void Reload(String lib_path, String model_path, String app_config_json = "") {
     // Step 1. Set tokenizer.
     this->tokenizer_ = TokenizerFromPath(model_path);
 
     // Step 2. Initialize vm, we use the packed function mechanism
     // so there is no explicit abi dependency on these extra
     // classes other than basic tvm runtime.
-    auto fload_exec = executable->GetFunction("vm_load_executable");
-    ICHECK(fload_exec.defined()) << "TVM runtime cannot find vm_load_executable";
-    vm_ = fload_exec();
-    vm_->GetFunction("vm_initialization")(static_cast<int>(device_.device_type), device_.device_id,
-                                          static_cast<int>(relax_vm::AllocatorType::kPooled),
-                                          static_cast<int>(kDLCPU), 0,
-                                          static_cast<int>(relax_vm::AllocatorType::kPooled));
+    tvm::runtime::Module executable = tvm::runtime::Module::LoadFromFile(lib_path);
+    auto f_func_exists_ = executable->GetFunction("func_exists");
+    ICHECK(f_func_exists_.defined()) << "TVM runtime cannot find func_exists";
 
-    prefill_func_ = vm_->GetFunction("prefill");
-    embed_func_ = vm_->GetFunction("embed");
-    prefill_with_embed_func_ = vm_->GetFunction("prefill_with_embed");
-    decode_func_ = vm_->GetFunction("decode");
-    encoding_without_cache_func_ = vm_->GetFunction("encoding_without_cache");
-    softmax_func_ = vm_->GetFunction("softmax_with_temperature");
-    get_metadata_func_ = vm_->GetFunction("get_metadata");
+    auto fthreaded_session = tvm::runtime::Registry::Get("runtime.disco.SessionThreaded");
+    ICHECK(fthreaded_session) << "TVM runtime cannot find runtime.disco.SessionThreaded";
+    session_ = (*fthreaded_session)(1);
 
+    auto fnccl_init = session_->GetGlobalFunc("runtime.disco.nccl.init_ccl");
+    session_->CallPacked(fnccl_init, 0);
+
+    auto fvm_load_module = session_->GetGlobalFunc("runtime.disco.load_vm_module");
+    auto mod = session_->CallPacked(fvm_load_module, lib_path, device_);
+
+    auto fmodule_get_function = session_->GetGlobalFunc("runtime.ModuleGetFunction");
+
+    prefill_func_ = session_->CallPacked(fmodule_get_function, mod, "prefill", false);
+    func_exists_[prefill_func_] = f_func_exists_("prefill");
+    embed_func_ = session_->CallPacked(fmodule_get_function, mod, "embed", false);
+    func_exists_[embed_func_] = f_func_exists_("embed");
+    prefill_with_embed_func_ = session_->CallPacked(fmodule_get_function, mod, "prefill_with_embed",
+                                                    false);
+    func_exists_[prefill_with_embed_func_] = f_func_exists_("prefill_with_embed");
+    decode_func_ = session_->CallPacked(fmodule_get_function, mod, "decode", false);
+    func_exists_[decode_func_] = f_func_exists_("decode");
+    encoding_without_cache_func_ =  
+        session_->CallPacked(fmodule_get_function, mod, "encoding_without_cache", false);
+    func_exists_[encoding_without_cache_func_] = f_func_exists_("encoding_without_cache");
+    softmax_func_ = session_->CallPacked(fmodule_get_function, mod, "softmax_with_temperature", false);
+    func_exists_[softmax_func_] = f_func_exists_("softmax_with_temperature");
+    tuple_getitem_func_ = session_->GetGlobalFunc("vm.builtin.tuple_getitem");
     auto fsample_topp_from_prob_ptr =
         tvm::runtime::Registry::Get("vm.builtin.sample_top_p_from_prob");
     ICHECK(fsample_topp_from_prob_ptr)
@@ -268,39 +285,33 @@ class LLMChat {
     fsample_topp_from_logits_ = *fsample_topp_from_logits_ptr;
 
     // Step 3. Load params in nd-array cache.
-    const PackedFunc* fload_cache = tvm::runtime::Registry::Get("vm.builtin.ndarray_cache.load");
-    ICHECK(fload_cache) << "TVM runtime cannot find vm.builtin.ndarray_cache.load";
-    (*fload_cache)(model_path, static_cast<int32_t>(device_.device_type), device_.device_id);
 
-    const PackedFunc* fload_params =
-        tvm::runtime::Registry::Get("vm.builtin.param_array_from_cache");
-    ICHECK(fload_params) << "Cannot find env function vm.builtin.param_array_from_cache";
-    params_ = (*fload_params)("param", -1);
+    auto fcreate_shard_loader = session_->GetGlobalFunc("runtime.disco.ShardLoader");
+    auto fload_shard = session_->GetGlobalFunc("runtime.disco.ShardLoaderLoadAll");
+    // FIXME: fix the shard info
+    picojson::object shard_info;
+    std::string shard_info_str = picojson::value(shard_info).serialize(true);
 
-    // after we get params, it is safe to simply clear the cached version
-    // as these params are referenced by params_
-    const PackedFunc* fclear_ndarray_cache =
-        tvm::runtime::Registry::Get("vm.builtin.ndarray_cache.clear");
-    ICHECK(fclear_ndarray_cache) << "Cannot find env function vm.builtin.ndarray_cache.clear";
-    (*fclear_ndarray_cache)();
-
-    const PackedFunc* fkvcache_array_popn =
-        tvm::runtime::Registry::Get("vm.builtin.attention_kv_cache_array_popn");
-    ICHECK(fkvcache_array_popn)
-        << "Cannot find env function vm.builtin.attention_kv_cache_array_popn";
-    fkvcache_array_popn_ = *fkvcache_array_popn;
-
+    std::string json_path = model_path + "/ndarray-cache.json";
+    auto ndarray_cache_metadata = LoadBytesFromFile(json_path);
+    PackedFunc tmp(nullptr);
+    auto loader = session_->CallPacked(fcreate_shard_loader,json_path,
+                                       ndarray_cache_metadata, shard_info_str, tmp);
+    params_ = session_->CallPacked(fload_shard, loader);
     // Step 4. KV cache creation.
-    kv_cache_ = vm_->GetFunction("create_kv_cache")();
 
+    auto fcreate_kv_cache = session_->CallPacked(fmodule_get_function, mod, "create_kv_cache",
+                                                 false);
+    kv_cache_ = session_->CallPacked(fcreate_kv_cache);
+
+    fkvcache_array_popn_ = session_->GetGlobalFunc("vm.builtin.attention_kv_cache_array_popn");
     // Step 5. KV cache reset.
-    reset_kv_cache_func_ = vm_->GetFunction("reset_kv_cache");
-    if (!reset_kv_cache_func_.defined()) {
-      auto attention_kv_cache_array_clear_ptr =
-          tvm::runtime::Registry::Get("vm.builtin.attention_kv_cache_array_clear");
-      ICHECK(attention_kv_cache_array_clear_ptr)
-          << "TVM runtime cannot find vm.builtin.attention_kv_cache_array_clear";
-      reset_kv_cache_func_ = *attention_kv_cache_array_clear_ptr;
+    reset_kv_cache_func_ = session_->CallPacked(fmodule_get_function, mod, "reset_kv_cache",
+                                                false);
+    if (!f_func_exists_("reset_kv_cache")) {
+      auto attention_kv_cache_array_clear_ptr = session_->GetGlobalFunc("vm.builtin.attention_kv_cache_array_clear");
+
+      reset_kv_cache_func_ = attention_kv_cache_array_clear_ptr;
       support_backtracking_kv_ = true;
     } else {
       // if there is a customized reset kv
@@ -318,19 +329,12 @@ class LLMChat {
     LoadJSONOverride(config_str, false);
 
     // Step 7. Process metadata
-    String metadata_str = this->get_metadata_func_();
-    picojson::value metadata_info;
-    picojson::parse(metadata_info, std::string(metadata_str));
-    auto metadata = metadata_info.get<picojson::object>();
-    ICHECK(metadata["model_name"].is<std::string>());
-    ICHECK(metadata["max_window_size"].is<int64_t>());
-    this->model_name_ = metadata["model_name"].get<std::string>();
-    this->max_window_size_ = metadata["max_window_size"].get<int64_t>();
-    if (this->max_window_size_ == -1) {
-      this->max_window_size_ = std::numeric_limits<int64_t>::max();
-    }
 
-    // Step 7. Override configuration from app_config_json.
+    // fixme: load from json
+    this->model_name_ = "Llama-2-7b-chat-hf-q4f16_1";
+    this->max_window_size_ = 2048;
+
+    // Step 8. Override configuration from app_config_json.
     if (!app_config_json.empty()) {
       LoadJSONOverride(app_config_json, true);
     }
@@ -338,29 +342,29 @@ class LLMChat {
     this->ResetChat();
   }
 
-  // TODO: remove the legacy initialization func after updating app and web sides.
-  void InitChatLegacy(String conv_template, double temperature, double top_p, int64_t mean_gen_len,
-                      double shift_fill_factor) {
-    // Process metadata
-    std::string metadata_str = this->GetMetadata();
-    picojson::value metadata_info;
-    picojson::parse(metadata_info, metadata_str);
-    auto metadata = metadata_info.get<picojson::object>();
-    ICHECK(metadata["model_name"].is<std::string>());
-    ICHECK(metadata["max_window_size"].is<int64_t>());
-    ICHECK(metadata["add_prefix_space"].is<bool>());
-    this->model_name_ = metadata["model_name"].get<std::string>();
-    this->max_window_size_ = metadata["max_window_size"].get<int64_t>();
-    if (this->max_window_size_ == -1) {
-      this->max_window_size_ = std::numeric_limits<int64_t>::max();
-    }
-    this->conversation_ = Conversation::FromTemplate(conv_template);
-    this->temperature_ = temperature;
-    this->top_p_ = top_p;
-    this->mean_gen_len_ = mean_gen_len;
-    this->shift_fill_factor_ = shift_fill_factor;
-    this->ResetChat();
-  }
+  // // TODO: remove the legacy initialization func after updating app and web sides.
+  // void InitChatLegacy(String conv_template, double temperature, double top_p, int64_t mean_gen_len,
+  //                     double shift_fill_factor) {
+  //   // Process metadata
+  //   std::string metadata_str = this->GetMetadata();
+  //   picojson::value metadata_info;
+  //   picojson::parse(metadata_info, metadata_str);
+  //   auto metadata = metadata_info.get<picojson::object>();
+  //   ICHECK(metadata["model_name"].is<std::string>());
+  //   ICHECK(metadata["max_window_size"].is<int64_t>());
+  //   ICHECK(metadata["add_prefix_space"].is<bool>());
+  //   this->model_name_ = metadata["model_name"].get<std::string>();
+  //   this->max_window_size_ = metadata["max_window_size"].get<int64_t>();
+  //   if (this->max_window_size_ == -1) {
+  //     this->max_window_size_ = std::numeric_limits<int64_t>::max();
+  //   }
+  //   this->conversation_ = Conversation::FromTemplate(conv_template);
+  //   this->temperature_ = temperature;
+  //   this->top_p_ = top_p;
+  //   this->mean_gen_len_ = mean_gen_len;
+  //   this->shift_fill_factor_ = shift_fill_factor;
+  //   this->ResetChat();
+  // }
 
   void ResetChat() {
     // TODO(mlc-team): add conversation_.Reset to preserve system prompt
@@ -494,10 +498,6 @@ class LLMChat {
     return view;
   }
 
-  std::string GetMetadata() {
-    ObjectRef ret = this->get_metadata_func_();
-    return std::string(Downcast<String>(ret));
-  }
 
   std::vector<int32_t> PrepareBeforeEmbedding(std::string inp, bool append_conversation = true,
                                               PlaceInPrompt place_in_prompt = PlaceInPrompt::kAll) {
@@ -527,21 +527,23 @@ class LLMChat {
    * \param place_in_prompt The place of the input message in the prompt.
    * \return the embedding of the tokenized prompt.
    */
-  NDArray EmbedStep(std::string inp, bool append_conversation = true,
+  DRef EmbedStep(std::string inp, bool append_conversation = true,
                     PlaceInPrompt place_in_prompt = PlaceInPrompt::kAll) {
     std::vector<int32_t> prompt_tokens =
         PrepareBeforeEmbedding(inp, append_conversation, place_in_prompt);
     int64_t token_len = static_cast<int64_t>(prompt_tokens.size());
     if (token_len == 0) {
-      return NDArray::Empty({}, DataType::Float(32), device_);
+      auto empty_func = session_->GetGlobalFunc("runtime.disco.empty");
+      return session_->CallPacked(empty_func, ShapeTuple({}), DataType::Float(32), device_);
     }
 
-    CHECK(embed_func_.defined()) << "In order to use the embedding functionality, make sure you "
+    CHECK(func_exists_[embed_func_]) << "In order to use the embedding functionality, make sure you "
                                     "build the model in MLC-LLM with `sep_embed` option on.";
     auto tstart = std::chrono::high_resolution_clock::now();
 
     NDArray input_data = this->GetInputTokenNDArray(prompt_tokens);
-    NDArray embedding = embed_func_(input_data, params_);
+    DRef input_dref = session_->CopyToWorker0Wrapper(input_data);
+    DRef embedding = session_->CallPacked(embed_func_, input_dref, params_);
 
     int32_t new_seq_len = total_seq_len_ + token_len;
     total_seq_len_ = new_seq_len;
@@ -558,14 +560,18 @@ class LLMChat {
    * \param embedding The embedding to prefill with.
    * \param decode_next_token Whether to decode next token.
    */
-  void PrefillWithEmbedStep(NDArray embedding, bool decode_next_token = true) {
-    if (embedding.Shape().size() == 0) {
+  void PrefillWithEmbedStep(DRef embedding, bool decode_next_token = true) {
+    LOG(FATAL) << "disco is not compatible with embed step";
+    NDArray embedding_ndarray;
+    session_->CopyFromWorker0(embedding_ndarray, embedding);
+    session_->SyncWorker(0);
+    if (embedding_ndarray.Shape().size() == 0) {
       return;
     }
 
     auto tstart = std::chrono::high_resolution_clock::now();
 
-    int64_t token_len = embedding.Shape()[1];
+    int64_t token_len = embedding_ndarray.Shape()[1];
     NDArray logits_on_device = this->ForwardEmbeddings(embedding, total_seq_len_);
 
     if (!decode_next_token) {
@@ -593,14 +599,13 @@ class LLMChat {
    */
   void PrefillStep(std::string inp, bool append_conversation = true, bool decode_next_token = true,
                    PlaceInPrompt place_in_prompt = PlaceInPrompt::kAll) {
-    if (embed_func_.defined() && prefill_with_embed_func_.defined()) {
+    if (func_exists_[embed_func_] && func_exists_[prefill_with_embed_func_]) {
       // Temporarily placed inside `PrefillStep` for compatibility in transition.
       // Will be separated out in the future.
-      NDArray embedding = EmbedStep(inp, append_conversation, place_in_prompt);
+      DRef embedding = EmbedStep(inp, append_conversation, place_in_prompt);
       PrefillWithEmbedStep(embedding, decode_next_token);
       return;
     }
-
     std::vector<int32_t> prompt_tokens =
         this->PrepareBeforeEmbedding(inp, append_conversation, place_in_prompt);
     int64_t token_len = static_cast<int64_t>(prompt_tokens.size());
@@ -610,6 +615,15 @@ class LLMChat {
 
     int32_t new_seq_len = total_seq_len_ + token_len;
     NDArray logits_on_device = this->ForwardTokens(prompt_tokens, new_seq_len);
+    // this->UpdateLogitsOrProbOnCPUSync(logits_on_device);
+    // TVMSynchronize(device_.device_type, device_.device_id, nullptr);
+    // // print first few logits for eyeballs
+    // std::ostringstream os;
+    // for (int i = 0; i < 10; ++i) {
+    //   if (i != 0) os << ", ";
+    //   os << static_cast<float*>(logits_on_cpu_->data)[i];
+    // }
+    // LOG(INFO) << "logits[:10] =[" << os.str() << "]";
     total_seq_len_ = new_seq_len;
 
     if (!decode_next_token) {
@@ -813,7 +827,7 @@ class LLMChat {
             if (output_message_.length() <= stop_pos) break;
           }
           // resize kv to remove the context
-          fkvcache_array_popn_(kv_cache_, backoff);
+          session_->CallPacked(fkvcache_array_popn_, kv_cache_, backoff);
           total_seq_len_ -= backoff;
         }
       }
@@ -831,35 +845,55 @@ class LLMChat {
 
   // run forward compute
   NDArray ForwardTokens(std::vector<int32_t> input_tokens, int64_t cur_pos) {
-    Array<ObjectRef> ret;
-    if (input_tokens.size() > 1 && prefill_func_.defined()) {
+    NDArray ret_ndarray;
+    if (input_tokens.size() > 1 && func_exists_[prefill_func_]) {
       NDArray input_data = this->GetInputTokenNDArray(input_tokens);
-      ret = prefill_func_(input_data, ShapeTuple({cur_pos}), kv_cache_, params_);
+      DRef input_dref = session_->CopyToWorker0Wrapper(input_data);
+      tvm::runtime::ShapeTuple cur_pos_shape = {cur_pos};
+      DRef ret = session_->CallPacked(prefill_func_, input_dref, cur_pos_shape, kv_cache_,
+                                      params_);
+      ret = session_->CallPacked(tuple_getitem_func_, ret, 0);
+      ret_ndarray = ret->DebugGetFromRemote(0);
+      // session_->CopyFromWorker0(ret_ndarray, ret);
+      // session_->SyncWorker(0);
     } else {
       // running decode function when prefill is not available
       for (int i = 0; i < input_tokens.size(); ++i) {
         NDArray input_data = this->GetInputTokenNDArray({input_tokens[i]});
         int64_t pos = cur_pos + i + 1 - input_tokens.size();
-        ret = decode_func_(input_data, ShapeTuple({pos}), kv_cache_, params_);
+        DRef input_dref = session_->CopyToWorker0Wrapper(input_data);
+        tvm::runtime::ShapeTuple pos_shape = {pos};
+        DRef ret = session_->CallPacked(decode_func_, input_dref, pos_shape, kv_cache_, params_);
+        ret = session_->CallPacked(tuple_getitem_func_, ret, 0);
+        ret_ndarray = ret->DebugGetFromRemote(0);
+        // session_->CopyFromWorker0(ret_ndarray, ret);
+        // session_->SyncWorker(0);
       }
     }
-    return Downcast<NDArray>(ret[0]);
+    return ret_ndarray;
   }
 
   // run forward compute with embeddings
-  NDArray ForwardEmbeddings(NDArray embeddings, int64_t cur_pos) {
-    Array<ObjectRef> ret;
-    CHECK(prefill_with_embed_func_.defined());
-    ret = prefill_with_embed_func_(embeddings, ShapeTuple({cur_pos}), kv_cache_, params_);
-    return Downcast<NDArray>(ret[0]);
+  NDArray ForwardEmbeddings(DRef embeddings, int64_t cur_pos) {
+    tvm::runtime::ShapeTuple cur_pos_shape = {cur_pos};
+    DRef ret = session_->CallPacked(prefill_with_embed_func_, embeddings, cur_pos_shape, kv_cache_, params_);
+    ret = session_->CallPacked(tuple_getitem_func_, ret, 0);
+    NDArray ret_ndarray = ret->DebugGetFromRemote(0);
+    // session_->CopyFromWorker0(ret_ndarray, ret);
+    // session_->SyncWorker(0);
+    return ret_ndarray;
   }
 
   NDArray Softmax(NDArray input, float temperature) {
     NDArray temperature_arr = NDArray::Empty({}, DataType::Float(32), device_);
     temperature_arr.CopyFromBytes(&temperature, sizeof(float));
-    NDArray ret;
-    ret = softmax_func_(input, temperature_arr);
-    return ret;
+    DRef input_dref = session_->CopyToWorker0Wrapper(input);
+    DRef temperature_dref = session_->CopyToWorker0Wrapper(temperature_arr);
+    DRef ret = session_->CallPacked(softmax_func_, input_dref, temperature_dref);
+    NDArray ret_ndarray = ret->DebugGetFromRemote(0);
+    // session_->CopyFromWorker0(ret_ndarray, ret);
+    // session_->SyncWorker(0);
+    return ret_ndarray;
   }
 
   void ApplyRepetitionPenaltyOnCPU() {
@@ -907,7 +941,7 @@ class LLMChat {
   }
 
   // Clear kv cache
-  void ResetKVCache() { reset_kv_cache_func_(kv_cache_); }
+  void ResetKVCache() { session_->CallPacked(reset_kv_cache_func_, kv_cache_); }
 
   void ProcessSystemPrompts() {
     this->PrefillStep(/*inp=*/"", /*append_conversation=*/false, /*decode_next_token=*/false);
@@ -987,38 +1021,40 @@ class LLMChat {
   //----------------------------
   // runtime device
   Device device_;
-  // The vm module
-  Module vm_;
   // encoding function
-  PackedFunc prefill_func_;
+  DRef prefill_func_;
   // embedding function
-  PackedFunc embed_func_;
+  DRef embed_func_;
   // encoding using embedding function
-  PackedFunc prefill_with_embed_func_;
+  DRef prefill_with_embed_func_;
   // decoding function
-  PackedFunc decode_func_;
+  DRef decode_func_;
   // encoding without cache
-  PackedFunc encoding_without_cache_func_;
+  DRef encoding_without_cache_func_;
   // softmax
-  PackedFunc softmax_func_;
-  // get model metadata
-  PackedFunc get_metadata_func_;
+  DRef softmax_func_;
   // reset kv cache
-  PackedFunc reset_kv_cache_func_;
+  DRef reset_kv_cache_func_;
+  // tuple get item
+  DRef tuple_getitem_func_;
   // sample top p from logits
   PackedFunc fsample_topp_from_logits_;
   // sample top p from prob
   PackedFunc fsample_topp_from_prob_;
   // pop n entries from kvcache
-  PackedFunc fkvcache_array_popn_;
+  DRef fkvcache_array_popn_;
   // input token id
   NDArray input_token_ids_{nullptr};
   // local params
-  Array<NDArray> params_;
+  DRef params_;
   // KV cache
-  Array<ObjectRef> kv_cache_;
+  DRef kv_cache_;
   // Temp logits on cpu
   NDArray logits_on_cpu_{nullptr};
+  // disco session
+  tvm::runtime::Session session_;
+  // map of which function exists
+  std::unordered_map<DRef, int, ObjectPtrHash, ObjectPtrEqual> func_exists_;
 };
 
 /*!
@@ -1112,12 +1148,12 @@ class LLMChatModule : public ModuleNode {
     } else if (name == "decode") {
       return PackedFunc(
           [this, sptr_to_self](TVMArgs args, TVMRetValue* rv) { GetChat()->DecodeStep(); });
-    } else if (name == "init_chat_legacy") {
-      // TODO: remove the legacy initialization func after updating app and web sides.
-      return PackedFunc([this, sptr_to_self](TVMArgs args, TVMRetValue* rv) {
-        ICHECK_EQ(args.size(), 5);
-        GetChat()->InitChatLegacy(args[0], args[1], args[2], args[3], args[4]);
-      });
+    // } else if (name == "init_chat_legacy") {
+    //   // TODO: remove the legacy initialization func after updating app and web sides.
+    //   return PackedFunc([this, sptr_to_self](TVMArgs args, TVMRetValue* rv) {
+    //     ICHECK_EQ(args.size(), 5);
+    //     GetChat()->InitChatLegacy(args[0], args[1], args[2], args[3], args[4]);
+    //   });
     } else if (name == "reset_chat") {
       return PackedFunc([this, sptr_to_self](TVMArgs args, TVMRetValue* rv) {
         ICHECK_EQ(args.size(), 0);
@@ -1169,60 +1205,6 @@ class LLMChatModule : public ModuleNode {
   LLMChat* GetChat() {
     ICHECK(chat_ != nullptr) << "Chat is not initialized via reload";
     return chat_.get();
-  }
-
-  // TODO: legacy function to be removed
-  void InitLegacy(tvm::runtime::Module executable, std::unique_ptr<Tokenizer> tokenizer,
-                  const tvm::runtime::String& param_path, DLDevice device) {
-    chat_ = std::make_unique<LLMChat>(LLMChat(device_));
-    // setup members
-    device_ = device;
-    chat_->device_ = device;
-    chat_->tokenizer_ = std::move(tokenizer);
-
-    // load in nd-array cache
-    const PackedFunc* fload_cache = tvm::runtime::Registry::Get("vm.builtin.ndarray_cache.load");
-    ICHECK(fload_cache) << "TVM runtime cannot find vm.builtin.ndarray_cache.load";
-    (*fload_cache)(param_path, static_cast<int32_t>(device_.device_type), device.device_id);
-
-    // initialize vm, we use the packed function mechanism
-    // so there is no explicit abi dependency on these extra
-    // classes other than basic tvm runtime.
-    auto fload_exec = executable->GetFunction("vm_load_executable");
-    ICHECK(fload_exec.defined()) << "TVM runtime cannot find vm_load_executable";
-    chat_->vm_ = fload_exec();
-
-    chat_->vm_->GetFunction("vm_initialization")(
-        static_cast<int>(device.device_type), device.device_id,
-        static_cast<int>(relax_vm::AllocatorType::kPooled), static_cast<int>(kDLCPU), 0,
-        static_cast<int>(relax_vm::AllocatorType::kPooled));
-
-    chat_->prefill_func_ = chat_->vm_->GetFunction("prefill");
-    chat_->decode_func_ = chat_->vm_->GetFunction("decode");
-    chat_->encoding_without_cache_func_ = chat_->vm_->GetFunction("encoding_without_cache");
-    chat_->softmax_func_ = chat_->vm_->GetFunction("softmax_with_temperature");
-    chat_->get_metadata_func_ = chat_->vm_->GetFunction("get_metadata");
-    auto kv_cache_func = chat_->vm_->GetFunction("create_kv_cache");
-
-    auto fsample_topp_from_prob_ptr =
-        tvm::runtime::Registry::Get("vm.builtin.sample_top_p_from_prob");
-    ICHECK(fsample_topp_from_prob_ptr)
-        << "Cannot find env function vm.builtin.sample_top_p_from_prob";
-    chat_->fsample_topp_from_prob_ = *fsample_topp_from_prob_ptr;
-    auto fsample_topp_from_logits_ptr =
-        tvm::runtime::Registry::Get("vm.builtin.sample_top_p_from_logits");
-    ICHECK(fsample_topp_from_logits_ptr)
-        << "Cannot find env function vm.builtin.sample_top_p_from_logits";
-    chat_->fsample_topp_from_logits_ = *fsample_topp_from_logits_ptr;
-
-    // parameter loading
-    const PackedFunc* fload_params =
-        tvm::runtime::Registry::Get("vm.builtin.param_array_from_cache");
-    ICHECK(fload_params) << "Cannot find env function vm.builtin.param_array_from_cache";
-    chat_->params_ = (*fload_params)("param", -1);
-
-    // KV cache creation
-    chat_->kv_cache_ = chat_->vm_->GetFunction("create_kv_cache")();
   }
 
   const char* type_key() const final { return "mlc.llm_chat"; }
@@ -1303,33 +1285,33 @@ TVM_REGISTER_GLOBAL("mlc.llm_chat_create").set_body_typed([](int device_type, in
   return CreateChatModule(DLDevice{static_cast<DLDeviceType>(device_type), device_id});
 });
 
-// TODO: legacy function to be removed
-tvm::runtime::Module CreateChatModuleLegacy(tvm::runtime::Module executable,
-                                            std::unique_ptr<Tokenizer> tokenizer,
-                                            const tvm::runtime::String& param_path,
-                                            DLDevice device) {
-  ObjectPtr<LLMChatModule> n = make_object<LLMChatModule>();
-  n->InitLegacy(executable, std::move(tokenizer), param_path, device);
-  return Module(n);
-}
+// // TODO: legacy function to be removed
+// tvm::runtime::Module CreateChatModuleLegacy(tvm::runtime::Module executable,
+//                                             std::unique_ptr<Tokenizer> tokenizer,
+//                                             const tvm::runtime::String& param_path,
+//                                             DLDevice device) {
+//   ObjectPtr<LLMChatModule> n = make_object<LLMChatModule>();
+//   n->InitLegacy(executable, std::move(tokenizer), param_path, device);
+//   return Module(n);
+// }
 
-// TODO: legacy function to be removed
-tvm::runtime::Module CreateChatModuleLegacy(tvm::runtime::Module executable,
-                                            const tvm::runtime::String& tokenizer_path,
-                                            const tvm::runtime::String& param_path,
-                                            DLDevice device) {
-  // tokenizer stored in single files.
-  return CreateChatModuleLegacy(executable, TokenizerFromPath(tokenizer_path), param_path, device);
-}
+// // TODO: legacy function to be removed
+// tvm::runtime::Module CreateChatModuleLegacy(tvm::runtime::Module executable,
+//                                             const tvm::runtime::String& tokenizer_path,
+//                                             const tvm::runtime::String& param_path,
+//                                             DLDevice device) {
+//   // tokenizer stored in single files.
+//   return CreateChatModuleLegacy(executable, TokenizerFromPath(tokenizer_path), param_path, device);
+// }
 
 // TODO: legacy function to be removed
 // register as a system function that can be queried
-TVM_REGISTER_GLOBAL("mlc.llm_chat_create_legacy")
-    .set_body_typed([](tvm::runtime::Module executable, const tvm::runtime::String& tokenizer_path,
-                       const tvm::runtime::String& param_path, int device_type, int device_id) {
-      return CreateChatModuleLegacy(executable, tokenizer_path, param_path,
-                                    DLDevice{static_cast<DLDeviceType>(device_type), device_id});
-    });
+// TVM_REGISTER_GLOBAL("mlc.llm_chat_create_legacy")
+//     .set_body_typed([](tvm::runtime::Module executable, const tvm::runtime::String& tokenizer_path,
+//                        const tvm::runtime::String& param_path, int device_type, int device_id) {
+//       return CreateChatModuleLegacy(executable, tokenizer_path, param_path,
+//                                     DLDevice{static_cast<DLDeviceType>(device_type), device_id});
+//     });
 
 }  // namespace llm
 }  // namespace mlc

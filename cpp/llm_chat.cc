@@ -161,6 +161,24 @@ class LLMChat {
     } else {
       CHECK(partial_update) << "Key \"temperature\" not found.";
     }
+    if (config.count("vocab_size")) {
+      CHECK(config["vocab_size"].is<int64_t>());
+      this->vocab_size_ = config["vocab_size"].get<int64_t>();
+    } else {
+      CHECK(partial_update) << "Key \"vocab_size\" not found.";
+    }
+    if(config.count("max_window_size")) {
+      CHECK(config["max_window_size"].is<int64_t>());
+      this->max_window_size_ = config["max_window_size"].get<int64_t>();
+    } else {
+      CHECK(partial_update) << "Key \"max_window_size\" not found.";
+    }
+    if(config.count("model_name")){
+      CHECK(config["model_name"].is<std::string>());
+      this->model_name_ = config["model_name"].get<std::string>();
+    } else {
+      CHECK(partial_update) << "Key \"model_name\" not found.";
+    }
     if (config.count("repetition_penalty")) {
       CHECK(config["repetition_penalty"].is<double>());
       CHECK(this->repetition_penalty_ > 0) << "Repetition penalty must be a positive number!";
@@ -845,7 +863,7 @@ class LLMChat {
 
   // run forward compute
   NDArray ForwardTokens(std::vector<int32_t> input_tokens, int64_t cur_pos) {
-    NDArray ret_ndarray;
+    NDArray ret_ndarray = NDArray::Empty({1, 1, vocab_size_}, DataType::Float(32), device_);
     if (input_tokens.size() > 1 && func_exists_[prefill_func_]) {
       NDArray input_data = this->GetInputTokenNDArray(input_tokens);
       DRef input_dref = session_->CopyToWorker0Wrapper(input_data);
@@ -853,9 +871,8 @@ class LLMChat {
       DRef ret = session_->CallPacked(prefill_func_, input_dref, cur_pos_shape, kv_cache_,
                                       params_);
       ret = session_->CallPacked(tuple_getitem_func_, ret, 0);
-      ret_ndarray = ret->DebugGetFromRemote(0);
-      // session_->CopyFromWorker0(ret_ndarray, ret);
-      // session_->SyncWorker(0);
+      session_->CopyFromWorker0(ret_ndarray, ret);
+      session_->SyncWorker(0);
     } else {
       // running decode function when prefill is not available
       for (int i = 0; i < input_tokens.size(); ++i) {
@@ -865,9 +882,8 @@ class LLMChat {
         tvm::runtime::ShapeTuple pos_shape = {pos};
         DRef ret = session_->CallPacked(decode_func_, input_dref, pos_shape, kv_cache_, params_);
         ret = session_->CallPacked(tuple_getitem_func_, ret, 0);
-        ret_ndarray = ret->DebugGetFromRemote(0);
-        // session_->CopyFromWorker0(ret_ndarray, ret);
-        // session_->SyncWorker(0);
+        session_->CopyFromWorker0(ret_ndarray, ret);
+        session_->SyncWorker(0);
       }
     }
     return ret_ndarray;
@@ -875,24 +891,24 @@ class LLMChat {
 
   // run forward compute with embeddings
   NDArray ForwardEmbeddings(DRef embeddings, int64_t cur_pos) {
+    NDArray ret_ndarray = NDArray::Empty({1, 1, vocab_size_}, DataType::Float(32), device_);
     tvm::runtime::ShapeTuple cur_pos_shape = {cur_pos};
     DRef ret = session_->CallPacked(prefill_with_embed_func_, embeddings, cur_pos_shape, kv_cache_, params_);
     ret = session_->CallPacked(tuple_getitem_func_, ret, 0);
-    NDArray ret_ndarray = ret->DebugGetFromRemote(0);
-    // session_->CopyFromWorker0(ret_ndarray, ret);
-    // session_->SyncWorker(0);
+    session_->CopyFromWorker0(ret_ndarray, ret);
+    session_->SyncWorker(0);
     return ret_ndarray;
   }
 
   NDArray Softmax(NDArray input, float temperature) {
+    NDArray ret_ndarray = NDArray::Empty(input.Shape(), DataType::Float(32), device_);
     NDArray temperature_arr = NDArray::Empty({}, DataType::Float(32), device_);
     temperature_arr.CopyFromBytes(&temperature, sizeof(float));
     DRef input_dref = session_->CopyToWorker0Wrapper(input);
     DRef temperature_dref = session_->CopyToWorker0Wrapper(temperature_arr);
     DRef ret = session_->CallPacked(softmax_func_, input_dref, temperature_dref);
-    NDArray ret_ndarray = ret->DebugGetFromRemote(0);
-    // session_->CopyFromWorker0(ret_ndarray, ret);
-    // session_->SyncWorker(0);
+    session_->CopyFromWorker0(ret_ndarray, ret);
+    session_->SyncWorker(0);
     return ret_ndarray;
   }
 
@@ -989,6 +1005,8 @@ class LLMChat {
   int64_t total_seq_len_{0};
   // max window size, mean generation length
   int64_t max_window_size_{768}, mean_gen_len_{128}, max_gen_len_{512};
+  // vocab size
+  int64_t vocab_size_;
   // shift window fill factor
   double shift_fill_factor_{0.3};
   // temperature

@@ -21,7 +21,7 @@ from mlc_llm.relax_model import (
     gpt_bigcode,
     gpt_neox,
     gptj,
-    llama,
+    llama_tp,
     minigpt,
     param_manager,
     rwkv,
@@ -542,14 +542,6 @@ def build_model_from_args(args: argparse.Namespace):
             "WARNING: q4f16_1 is preferred to q4f16_0, "
             "and it is highly recommended to use q4f16_1 instaed"
         )
-    if args.num_shards > 1:
-        if (args.build_model_only and args.convert_weight_only) or (
-            not args.build_model_only and not args.convert_weight_only
-        ):
-            raise ValueError(
-                "When num_shards > 1, precisely one of `build_model_only` and"
-                " `convert_weight_only` are expected to be set"
-            )
 
     os.makedirs(args.artifact_path, exist_ok=True)
     if args.debug_dump:
@@ -564,7 +556,7 @@ def build_model_from_args(args: argparse.Namespace):
             config = json.load(i_f)
     if not use_cache or args.convert_weight_only:
         if args.model_category == "llama":
-            mod, param_manager, params = llama.get_model(args, config)
+            mod, param_manager, params = llama_tp.get_model(args, config)
         elif args.model_category == "gpt_neox":
             mod, param_manager, params = gpt_neox.get_model(args, config)
         elif args.model_category == "gpt_bigcode":

@@ -185,7 +185,7 @@ class ParamManager:
     pidx2pname: Dict[int, str]
     torch_pname2binname: Dict[str, str]
 
-    def __init__(self) -> None:
+    def __init__(self, worker_num: int = 1) -> None:
         self.params = {}
         self.param_names = []
         self.params_in_func = {}
@@ -201,6 +201,8 @@ class ParamManager:
         self.f_run_prequantize = None
 
         self.qspec_updater_classes = []
+        self.worker_num = worker_num
+        self.mode = "dequantize"
 
     def register_params(
         self,
@@ -692,6 +694,33 @@ class ParamManager:
         else:
             # Apply the dequantization function.
             return bb.emit(f_dequantize(bb, qparams))
+    
+    # FIXME: can remove this hack later after DistIR is integrated
+    def to_convert_weight_mode(self):
+        if self.mode == "convert_weight":
+            return
+        self.mode = "convert_weight"
+        for param_name in self.params:
+            param = self.params[param_name]
+            sinfo = param.param_info
+            assert isinstance(sinfo, relax.TensorStructInfo)
+            shape = sinfo.shape
+            assert isinstance(shape, relax.ShapeExpr)
+            new_shape = relax.ShapeExpr([shape.values[i] if i != param.shard_dim else shape.values[i] // self.worker_num for i in range(len(shape.values))])
+            param.param_info = relax.TensorStructInfo(new_shape, sinfo.dtype, sinfo.vdevice)
+            
+    def to_dequantize_mode(self):
+        if self.mode == "dequantize":
+            return
+        self.mode = "dequantize"
+        for param_name in self.params:
+            param = self.params[param_name]
+            sinfo = param.param_info
+            assert isinstance(sinfo, relax.TensorStructInfo)
+            shape = sinfo.shape
+            assert isinstance(shape, relax.ShapeExpr)
+            new_shape = relax.ShapeExpr([shape.values[i] if i != param.shard_dim else shape.values[i] * self.worker_num for i in range(len(shape.values))])
+            param.param_info = relax.TensorStructInfo(new_shape, sinfo.dtype, sinfo.vdevice)
 
 
 @mutator

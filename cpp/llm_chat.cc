@@ -538,6 +538,16 @@ class LLMChat {
     return this->GetInputTokens(place_in_prompt);
   }
 
+  DRef CopyToWorker0(const NDArray& host_array) { 
+    Device dev {DLDeviceType(0), 0};
+    auto func = session_->GetGlobalFunc("runtime.disco.empty");
+    ShapeTuple shape = host_array.Shape();
+    DataType dtype = host_array.DataType();
+    DRef dref = session_->CallPacked(func, shape, dtype ,dev);
+    session_->CopyToWorker0(host_array, dref);
+    return dref;
+  }
+
   /*!
    * \brief Given the text input, generate the embedding of the tokenized prompt.
    * \param inp The input text string.
@@ -560,7 +570,7 @@ class LLMChat {
     auto tstart = std::chrono::high_resolution_clock::now();
 
     NDArray input_data = this->GetInputTokenNDArray(prompt_tokens);
-    DRef input_dref = session_->CopyToWorker0Wrapper(input_data);
+    DRef input_dref = CopyToWorker0(input_data);
     DRef embedding = session_->CallPacked(embed_func_, input_dref, params_);
 
     int32_t new_seq_len = total_seq_len_ + token_len;
@@ -866,7 +876,7 @@ class LLMChat {
     NDArray ret_ndarray = NDArray::Empty({1, 1, vocab_size_}, DataType::Float(32), device_);
     if (input_tokens.size() > 1 && func_exists_[prefill_func_]) {
       NDArray input_data = this->GetInputTokenNDArray(input_tokens);
-      DRef input_dref = session_->CopyToWorker0Wrapper(input_data);
+      DRef input_dref = CopyToWorker0(input_data);
       tvm::runtime::ShapeTuple cur_pos_shape = {cur_pos};
       DRef ret = session_->CallPacked(prefill_func_, input_dref, cur_pos_shape, kv_cache_,
                                       params_);
@@ -878,7 +888,7 @@ class LLMChat {
       for (int i = 0; i < input_tokens.size(); ++i) {
         NDArray input_data = this->GetInputTokenNDArray({input_tokens[i]});
         int64_t pos = cur_pos + i + 1 - input_tokens.size();
-        DRef input_dref = session_->CopyToWorker0Wrapper(input_data);
+        DRef input_dref = CopyToWorker0(input_data);
         tvm::runtime::ShapeTuple pos_shape = {pos};
         DRef ret = session_->CallPacked(decode_func_, input_dref, pos_shape, kv_cache_, params_);
         ret = session_->CallPacked(tuple_getitem_func_, ret, 0);
@@ -904,8 +914,8 @@ class LLMChat {
     NDArray ret_ndarray = NDArray::Empty(input.Shape(), DataType::Float(32), device_);
     NDArray temperature_arr = NDArray::Empty({}, DataType::Float(32), device_);
     temperature_arr.CopyFromBytes(&temperature, sizeof(float));
-    DRef input_dref = session_->CopyToWorker0Wrapper(input);
-    DRef temperature_dref = session_->CopyToWorker0Wrapper(temperature_arr);
+    DRef input_dref = CopyToWorker0(input);
+    DRef temperature_dref = CopyToWorker0(temperature_arr);
     DRef ret = session_->CallPacked(softmax_func_, input_dref, temperature_dref);
     session_->CopyFromWorker0(ret_ndarray, ret);
     session_->SyncWorker(0);
@@ -1040,37 +1050,37 @@ class LLMChat {
   // runtime device
   Device device_;
   // encoding function
-  DRef prefill_func_;
+  DRef prefill_func_{nullptr};
   // embedding function
-  DRef embed_func_;
+  DRef embed_func_{nullptr};
   // encoding using embedding function
-  DRef prefill_with_embed_func_;
+  DRef prefill_with_embed_func_{nullptr};
   // decoding function
-  DRef decode_func_;
+  DRef decode_func_{nullptr};
   // encoding without cache
-  DRef encoding_without_cache_func_;
+  DRef encoding_without_cache_func_{nullptr};
   // softmax
-  DRef softmax_func_;
+  DRef softmax_func_{nullptr};
   // reset kv cache
-  DRef reset_kv_cache_func_;
+  DRef reset_kv_cache_func_{nullptr};
   // tuple get item
-  DRef tuple_getitem_func_;
+  DRef tuple_getitem_func_{nullptr};
   // sample top p from logits
   PackedFunc fsample_topp_from_logits_;
   // sample top p from prob
   PackedFunc fsample_topp_from_prob_;
   // pop n entries from kvcache
-  DRef fkvcache_array_popn_;
+  DRef fkvcache_array_popn_{nullptr};
   // input token id
   NDArray input_token_ids_{nullptr};
   // local params
-  DRef params_;
+  DRef params_{nullptr};
   // KV cache
-  DRef kv_cache_;
+  DRef kv_cache_{nullptr};
   // Temp logits on cpu
   NDArray logits_on_cpu_{nullptr};
   // disco session
-  tvm::runtime::Session session_;
+  tvm::runtime::Session session_{nullptr};
   // map of which function exists
   std::unordered_map<DRef, int, ObjectPtrHash, ObjectPtrEqual> func_exists_;
 };

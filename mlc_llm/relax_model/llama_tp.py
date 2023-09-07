@@ -75,8 +75,11 @@ class LlamaMLP(nn.Module):
             self.down_proj = Linear(intermediate_size, hidden_size, dtype=dtype, bias=False)
         else:
             self.gate_proj = Linear(hidden_size, intermediate_size // self.worker_num, dtype=dtype, bias=False)
+            self.gate_proj.weight.shard_dim = 0
             self.down_proj = Linear(intermediate_size // self.worker_num, hidden_size, dtype=dtype, bias=False)
+            self.down_proj.weight.shard_dim = 1
             self.up_proj = Linear(hidden_size, intermediate_size // self.worker_num, dtype=dtype, bias=False)
+            self.up_proj.weight.shard_dim = 0
 
     def forward(self, x):
         if self.combine_matmul:
@@ -141,8 +144,12 @@ class LlamaAttention(nn.Module):
                 dtype=dtype,
                 bias=False,
             )
+            self.q_proj.weight.shard_dim = 0
+            self.k_proj.weight.shard_dim = 0
+            self.v_proj.weight.shard_dim = 0
 
         self.o_proj = Linear(self.hidden_size // self.worker_num, self.hidden_size, dtype=dtype, bias=False)
+        self.o_proj.weight.shard_dim = 1
 
     def forward(
         self,
@@ -702,11 +709,11 @@ def get_model(args, hf_config):
     config = LlamaFullyShardedConfig(
         **hf_config,
         dtype=dtype,
-        combine_matmul=True,
+        combine_matmul=False,
+        worker_num=args.num_shards,
     )
     if max_seq_len != -1:
         config.max_sequence_length = max_seq_len
-    config.worker_num = args.num_shards
 
     param_manager = ParamManager(args.num_shards)
     bb = relax.BlockBuilder()

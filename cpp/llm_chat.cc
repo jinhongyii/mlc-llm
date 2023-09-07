@@ -266,31 +266,40 @@ class LLMChat {
 
     auto fthreaded_session = tvm::runtime::Registry::Get("runtime.disco.SessionThreaded");
     ICHECK(fthreaded_session) << "TVM runtime cannot find runtime.disco.SessionThreaded";
-    session_ = (*fthreaded_session)(1);
+    session_ = (*fthreaded_session)(2);
+    // session_ = (*fthreaded_session)(1);
 
     auto fnccl_init = session_->GetGlobalFunc("runtime.disco.nccl.init_ccl");
-    session_->CallPacked(fnccl_init, 0);
+    session_->CallPacked(fnccl_init, 0, 1);
+    // session_->CallPacked(fnccl_init, 0);
 
     auto fvm_load_module = session_->GetGlobalFunc("runtime.disco.load_vm_module");
-    auto mod = session_->CallPacked(fvm_load_module, lib_path, device_);
+    auto mod = session_->CallPacked(fvm_load_module, lib_path, Device{DLDeviceType(0), 0});
 
     auto fmodule_get_function = session_->GetGlobalFunc("runtime.ModuleGetFunction");
 
     prefill_func_ = session_->CallPacked(fmodule_get_function, mod, "prefill", false);
+    LOG(INFO) << "prefill id " << prefill_func_->reg_id;
     func_exists_[prefill_func_] = f_func_exists_("prefill");
     embed_func_ = session_->CallPacked(fmodule_get_function, mod, "embed", false);
+    LOG(INFO) << "embed id " << embed_func_->reg_id;
     func_exists_[embed_func_] = f_func_exists_("embed");
     prefill_with_embed_func_ = session_->CallPacked(fmodule_get_function, mod, "prefill_with_embed",
                                                     false);
+    LOG(INFO) << "prefill_with_embed id " << prefill_with_embed_func_->reg_id;
     func_exists_[prefill_with_embed_func_] = f_func_exists_("prefill_with_embed");
     decode_func_ = session_->CallPacked(fmodule_get_function, mod, "decode", false);
+    LOG(INFO) << "decode id " << decode_func_->reg_id;
     func_exists_[decode_func_] = f_func_exists_("decode");
     encoding_without_cache_func_ =  
         session_->CallPacked(fmodule_get_function, mod, "encoding_without_cache", false);
+    LOG(INFO) << "encoding_without_cache id " << encoding_without_cache_func_->reg_id;
     func_exists_[encoding_without_cache_func_] = f_func_exists_("encoding_without_cache");
     softmax_func_ = session_->CallPacked(fmodule_get_function, mod, "softmax_with_temperature", false);
+    LOG(INFO) << "softmax id " << softmax_func_->reg_id;
     func_exists_[softmax_func_] = f_func_exists_("softmax_with_temperature");
     tuple_getitem_func_ = session_->GetGlobalFunc("vm.builtin.tuple_getitem");
+    LOG(INFO)<< "tuple_getitem id " << tuple_getitem_func_->reg_id;
     auto fsample_topp_from_prob_ptr =
         tvm::runtime::Registry::Get("vm.builtin.sample_top_p_from_prob");
     ICHECK(fsample_topp_from_prob_ptr)
@@ -305,11 +314,12 @@ class LLMChat {
     // Step 3. Load params in nd-array cache.
 
     auto fcreate_shard_loader = session_->GetGlobalFunc("runtime.disco.ShardLoader");
+    LOG(INFO) << "create shard loader id " << fcreate_shard_loader->reg_id;
     auto fload_shard = session_->GetGlobalFunc("runtime.disco.ShardLoaderLoadAll");
+    LOG(INFO) << "load shard id " << fload_shard->reg_id;
     // FIXME: fix the shard info
-    picojson::object shard_info;
-    std::string shard_info_str = picojson::value(shard_info).serialize(true);
-
+    std::string shard_info_str = "{ \"param_2\": 0 ,  \"param_3\": 0 ,  \"param_4\": 0 ,  \"param_5\": 0 ,  \"param_6\": 0 ,  \"param_7\": 0 ,  \"param_8\": 1 ,  \"param_9\": 1 ,  \"param_10\": 0 ,  \"param_11\": 0 ,  \"param_14\": 0 ,  \"param_15\": 0 ,  \"param_12\": 1 ,  \"param_13\": 1 ,  \"param_18\": 0 ,  \"param_19\": 0 ,  \"param_20\": 0 ,  \"param_21\": 0 ,  \"param_22\": 0 ,  \"param_23\": 0 ,  \"param_24\": 1 ,  \"param_25\": 1 ,  \"param_26\": 0 ,  \"param_27\": 0 ,  \"param_30\": 0 ,  \"param_31\": 0 ,  \"param_28\": 1 ,  \"param_29\": 1 ,  \"param_34\": 0 ,  \"param_35\": 0 ,  \"param_36\": 0 ,  \"param_37\": 0 ,  \"param_38\": 0 ,  \"param_39\": 0 ,  \"param_40\": 1 ,  \"param_41\": 1 ,  \"param_42\": 0 ,  \"param_43\": 0 ,  \"param_46\": 0 ,  \"param_47\": 0 ,  \"param_44\": 1 ,  \"param_45\": 1 ,  \"param_50\": 0 ,  \"param_51\": 0 ,  \"param_52\": 0 ,  \"param_53\": 0 ,  \"param_54\": 0 ,  \"param_55\": 0 ,  \"param_56\": 1 ,  \"param_57\": 1 ,  \"param_58\": 0 ,  \"param_59\": 0 ,  \"param_62\": 0 ,  \"param_63\": 0 ,  \"param_60\": 1 ,  \"param_61\": 1 ,  \"param_66\": 0 ,  \"param_67\": 0 ,  \"param_68\": 0 ,  \"param_69\": 0 ,  \"param_70\": 0 ,  \"param_71\": 0 ,  \"param_72\": 1 ,  \"param_73\": 1 ,  \"param_74\": 0 ,  \"param_75\": 0 ,  \"param_78\": 0 ,  \"param_79\": 0 ,  \"param_76\": 1 ,  \"param_77\": 1 ,  \"param_82\": 0 ,  \"param_83\": 0 ,  \"param_84\": 0 ,  \"param_85\": 0 ,  \"param_86\": 0 ,  \"param_87\": 0 ,  \"param_88\": 1 ,  \"param_89\": 1 ,  \"param_90\": 0 ,  \"param_91\": 0 ,  \"param_94\": 0 ,  \"param_95\": 0 ,  \"param_92\": 1 ,  \"param_93\": 1 ,  \"param_98\": 0 ,  \"param_99\": 0 ,  \"param_100\": 0 ,  \"param_101\": 0 ,  \"param_102\": 0 ,  \"param_103\": 0 ,  \"param_104\": 1 ,  \"param_105\": 1 ,  \"param_106\": 0 ,  \"param_107\": 0 ,  \"param_110\": 0 ,  \"param_111\": 0 ,  \"param_108\": 1 ,  \"param_109\": 1 ,  \"param_114\": 0 ,  \"param_115\": 0 ,  \"param_116\": 0 ,  \"param_117\": 0 ,  \"param_118\": 0 ,  \"param_119\": 0 ,  \"param_120\": 1 ,  \"param_121\": 1 ,  \"param_122\": 0 ,  \"param_123\": 0 ,  \"param_126\": 0 ,  \"param_127\": 0 ,  \"param_124\": 1 ,  \"param_125\": 1 ,  \"param_130\": 0 ,  \"param_131\": 0 ,  \"param_132\": 0 ,  \"param_133\": 0 ,  \"param_134\": 0 ,  \"param_135\": 0 ,  \"param_136\": 1 ,  \"param_137\": 1 ,  \"param_138\": 0 ,  \"param_139\": 0 ,  \"param_142\": 0 ,  \"param_143\": 0 ,  \"param_140\": 1 ,  \"param_141\": 1 ,  \"param_146\": 0 ,  \"param_147\": 0 ,  \"param_148\": 0 ,  \"param_149\": 0 ,  \"param_150\": 0 ,  \"param_151\": 0 ,  \"param_152\": 1 ,  \"param_153\": 1 ,  \"param_154\": 0 ,  \"param_155\": 0 ,  \"param_158\": 0 ,  \"param_159\": 0 ,  \"param_156\": 1 ,  \"param_157\": 1 ,  \"param_162\": 0 ,  \"param_163\": 0 ,  \"param_164\": 0 ,  \"param_165\": 0 ,  \"param_166\": 0 ,  \"param_167\": 0 ,  \"param_168\": 1 ,  \"param_169\": 1 ,  \"param_170\": 0 ,  \"param_171\": 0 ,  \"param_174\": 0 ,  \"param_175\": 0 ,  \"param_172\": 1 ,  \"param_173\": 1 ,  \"param_178\": 0 ,  \"param_179\": 0 ,  \"param_180\": 0 ,  \"param_181\": 0 ,  \"param_182\": 0 ,  \"param_183\": 0 ,  \"param_184\": 1 ,  \"param_185\": 1 ,  \"param_186\": 0 ,  \"param_187\": 0 ,  \"param_190\": 0 ,  \"param_191\": 0 ,  \"param_188\": 1 ,  \"param_189\": 1 ,  \"param_194\": 0 ,  \"param_195\": 0 ,  \"param_196\": 0 ,  \"param_197\": 0 ,  \"param_198\": 0 ,  \"param_199\": 0 ,  \"param_200\": 1 ,  \"param_201\": 1 ,  \"param_202\": 0 ,  \"param_203\": 0 ,  \"param_206\": 0 ,  \"param_207\": 0 ,  \"param_204\": 1 ,  \"param_205\": 1 ,  \"param_210\": 0 ,  \"param_211\": 0 ,  \"param_212\": 0 ,  \"param_213\": 0 ,  \"param_214\": 0 ,  \"param_215\": 0 ,  \"param_216\": 1 ,  \"param_217\": 1 ,  \"param_218\": 0 ,  \"param_219\": 0 ,  \"param_222\": 0 ,  \"param_223\": 0 ,  \"param_220\": 1 ,  \"param_221\": 1 ,  \"param_226\": 0 ,  \"param_227\": 0 ,  \"param_228\": 0 ,  \"param_229\": 0 ,  \"param_230\": 0 ,  \"param_231\": 0 ,  \"param_232\": 1 ,  \"param_233\": 1 ,  \"param_234\": 0 ,  \"param_235\": 0 ,  \"param_238\": 0 ,  \"param_239\": 0 ,  \"param_236\": 1 ,  \"param_237\": 1 ,  \"param_242\": 0 ,  \"param_243\": 0 ,  \"param_244\": 0 ,  \"param_245\": 0 ,  \"param_246\": 0 ,  \"param_247\": 0 ,  \"param_248\": 1 ,  \"param_249\": 1 ,  \"param_250\": 0 ,  \"param_251\": 0 ,  \"param_254\": 0 ,  \"param_255\": 0 ,  \"param_252\": 1 ,  \"param_253\": 1 ,  \"param_258\": 0 ,  \"param_259\": 0 ,  \"param_260\": 0 ,  \"param_261\": 0 ,  \"param_262\": 0 ,  \"param_263\": 0 ,  \"param_264\": 1 ,  \"param_265\": 1 ,  \"param_266\": 0 ,  \"param_267\": 0 ,  \"param_270\": 0 ,  \"param_271\": 0 ,  \"param_268\": 1 ,  \"param_269\": 1 ,  \"param_274\": 0 ,  \"param_275\": 0 ,  \"param_276\": 0 ,  \"param_277\": 0 ,  \"param_278\": 0 ,  \"param_279\": 0 ,  \"param_280\": 1 ,  \"param_281\": 1 ,  \"param_282\": 0 ,  \"param_283\": 0 ,  \"param_286\": 0 ,  \"param_287\": 0 ,  \"param_284\": 1 ,  \"param_285\": 1 ,  \"param_290\": 0 ,  \"param_291\": 0 ,  \"param_292\": 0 ,  \"param_293\": 0 ,  \"param_294\": 0 ,  \"param_295\": 0 ,  \"param_296\": 1 ,  \"param_297\": 1 ,  \"param_298\": 0 ,  \"param_299\": 0 ,  \"param_302\": 0 ,  \"param_303\": 0 ,  \"param_300\": 1 ,  \"param_301\": 1 ,  \"param_306\": 0 ,  \"param_307\": 0 ,  \"param_308\": 0 ,  \"param_309\": 0 ,  \"param_310\": 0 ,  \"param_311\": 0 ,  \"param_312\": 1 ,  \"param_313\": 1 ,  \"param_314\": 0 ,  \"param_315\": 0 ,  \"param_318\": 0 ,  \"param_319\": 0 ,  \"param_316\": 1 ,  \"param_317\": 1 ,  \"param_322\": 0 ,  \"param_323\": 0 ,  \"param_324\": 0 ,  \"param_325\": 0 ,  \"param_326\": 0 ,  \"param_327\": 0 ,  \"param_328\": 1 ,  \"param_329\": 1 ,  \"param_330\": 0 ,  \"param_331\": 0 ,  \"param_334\": 0 ,  \"param_335\": 0 ,  \"param_332\": 1 ,  \"param_333\": 1 ,  \"param_338\": 0 ,  \"param_339\": 0 ,  \"param_340\": 0 ,  \"param_341\": 0 ,  \"param_342\": 0 ,  \"param_343\": 0 ,  \"param_344\": 1 ,  \"param_345\": 1 ,  \"param_346\": 0 ,  \"param_347\": 0 ,  \"param_350\": 0 ,  \"param_351\": 0 ,  \"param_348\": 1 ,  \"param_349\": 1 ,  \"param_354\": 0 ,  \"param_355\": 0 ,  \"param_356\": 0 ,  \"param_357\": 0 ,  \"param_358\": 0 ,  \"param_359\": 0 ,  \"param_360\": 1 ,  \"param_361\": 1 ,  \"param_362\": 0 ,  \"param_363\": 0 ,  \"param_366\": 0 ,  \"param_367\": 0 ,  \"param_364\": 1 ,  \"param_365\": 1 ,  \"param_370\": 0 ,  \"param_371\": 0 ,  \"param_372\": 0 ,  \"param_373\": 0 ,  \"param_374\": 0 ,  \"param_375\": 0 ,  \"param_376\": 1 ,  \"param_377\": 1 ,  \"param_378\": 0 ,  \"param_379\": 0 ,  \"param_382\": 0 ,  \"param_383\": 0 ,  \"param_380\": 1 ,  \"param_381\": 1 ,  \"param_386\": 0 ,  \"param_387\": 0 ,  \"param_388\": 0 ,  \"param_389\": 0 ,  \"param_390\": 0 ,  \"param_391\": 0 ,  \"param_392\": 1 ,  \"param_393\": 1 ,  \"param_394\": 0 ,  \"param_395\": 0 ,  \"param_398\": 0 ,  \"param_399\": 0 ,  \"param_396\": 1 ,  \"param_397\": 1 ,  \"param_402\": 0 ,  \"param_403\": 0 ,  \"param_404\": 0 ,  \"param_405\": 0 ,  \"param_406\": 0 ,  \"param_407\": 0 ,  \"param_408\": 1 ,  \"param_409\": 1 ,  \"param_410\": 0 ,  \"param_411\": 0 ,  \"param_414\": 0 ,  \"param_415\": 0 ,  \"param_412\": 1 ,  \"param_413\": 1 ,  \"param_418\": 0 ,  \"param_419\": 0 ,  \"param_420\": 0 ,  \"param_421\": 0 ,  \"param_422\": 0 ,  \"param_423\": 0 ,  \"param_424\": 1 ,  \"param_425\": 1 ,  \"param_426\": 0 ,  \"param_427\": 0 ,  \"param_430\": 0 ,  \"param_431\": 0 ,  \"param_428\": 1 ,  \"param_429\": 1 ,  \"param_434\": 0 ,  \"param_435\": 0 ,  \"param_436\": 0 ,  \"param_437\": 0 ,  \"param_438\": 0 ,  \"param_439\": 0 ,  \"param_440\": 1 ,  \"param_441\": 1 ,  \"param_442\": 0 ,  \"param_443\": 0 ,  \"param_446\": 0 ,  \"param_447\": 0 ,  \"param_444\": 1 ,  \"param_445\": 1 ,  \"param_450\": 0 ,  \"param_451\": 0 ,  \"param_452\": 0 ,  \"param_453\": 0 ,  \"param_454\": 0 ,  \"param_455\": 0 ,  \"param_456\": 1 ,  \"param_457\": 1 ,  \"param_458\": 0 ,  \"param_459\": 0 ,  \"param_462\": 0 ,  \"param_463\": 0 ,  \"param_460\": 1 ,  \"param_461\": 1 ,  \"param_466\": 0 ,  \"param_467\": 0 ,  \"param_468\": 0 ,  \"param_469\": 0 ,  \"param_470\": 0 ,  \"param_471\": 0 ,  \"param_472\": 1 ,  \"param_473\": 1 ,  \"param_474\": 0 ,  \"param_475\": 0 ,  \"param_478\": 0 ,  \"param_479\": 0 ,  \"param_476\": 1 ,  \"param_477\": 1 ,  \"param_482\": 0 ,  \"param_483\": 0 ,  \"param_484\": 0 ,  \"param_485\": 0 ,  \"param_486\": 0 ,  \"param_487\": 0 ,  \"param_488\": 1 ,  \"param_489\": 1 ,  \"param_490\": 0 ,  \"param_491\": 0 ,  \"param_494\": 0 ,  \"param_495\": 0 ,  \"param_492\": 1 ,  \"param_493\": 1 ,  \"param_498\": 0 ,  \"param_499\": 0 ,  \"param_500\": 0 ,  \"param_501\": 0 ,  \"param_502\": 0 ,  \"param_503\": 0 ,  \"param_504\": 1 ,  \"param_505\": 1 ,  \"param_506\": 0 ,  \"param_507\": 0 ,  \"param_510\": 0 ,  \"param_511\": 0 ,  \"param_508\": 1 ,  \"param_509\": 1}";
+    // std::string shard_info_str = "{}";
     std::string json_path = model_path + "/ndarray-cache.json";
     auto ndarray_cache_metadata = LoadBytesFromFile(json_path);
     PackedFunc tmp(nullptr);
@@ -562,7 +572,7 @@ class LLMChat {
     int64_t token_len = static_cast<int64_t>(prompt_tokens.size());
     if (token_len == 0) {
       auto empty_func = session_->GetGlobalFunc("runtime.disco.empty");
-      return session_->CallPacked(empty_func, ShapeTuple({}), DataType::Float(32), device_);
+      return session_->CallPacked(empty_func, ShapeTuple({}), DataType::Float(32), Device{DLDeviceType(0), 0});
     }
 
     CHECK(func_exists_[embed_func_]) << "In order to use the embedding functionality, make sure you "

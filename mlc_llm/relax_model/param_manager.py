@@ -344,7 +344,7 @@ class ParamManager:
         updated_mod : tvm.IRModule
             The IRModule updated with the dequantization computation.
         """
-
+        self.to_dequantize_mode()
         # For each Relax function in the input IRModule (e.g., "prefill"),
         # we create its input relax.Var of all the quantized data, and
         # store the mapping from function name to the var.
@@ -380,9 +380,9 @@ class ParamManager:
     def get_quantized_param_info(self) -> List[relax.TensorStructInfo]:
         bb = relax.BlockBuilder()
 
-        if self.quantized_param_info is not None:
-            assert self.param2qrange is not None
-            return self.quantized_param_info
+        # if self.quantized_param_info is not None:
+        #     assert self.param2qrange is not None
+        #     return self.quantized_param_info
 
         self.param2qrange = dict()
         quantized_param_info: List[relax.TensorStructInfo] = []
@@ -677,6 +677,9 @@ class ParamManager:
             qparams: List[relax.Var] = []
             for qparam_idx in self.param2qrange[param]:
                 qparams.append(bb.emit(relax.TupleGetItem(quantized_tuple, qparam_idx)))
+            if param.shard_dim != None:
+                for qparam_idx in self.param2qrange[param]:
+                    print(""" \\\"param_"""+str(qparam_idx)+"""\\\":""", param.shard_dim, ", ", end="")
 
         # Get the dequantization function of this parameter.
         f_dequantize = param.quant_spec.get_dequantize_func(
@@ -700,29 +703,35 @@ class ParamManager:
         if self.mode == "convert_weight":
             return
         self.mode = "convert_weight"
-        for param_name in self.params:
-            param = self.params[param_name]
-            sinfo = param.param_info
-            assert isinstance(sinfo, relax.TensorStructInfo)
-            shape = sinfo.shape
-            assert isinstance(shape, relax.ShapeExpr)
-            new_shape = relax.ShapeExpr([shape.values[i] if i != param.shard_dim else shape.values[i] // self.worker_num for i in range(len(shape.values))])
-            param.param_info = relax.TensorStructInfo(new_shape, sinfo.dtype, sinfo.vdevice)
-            
-    def to_dequantize_mode(self):
-        if self.mode == "dequantize":
-            return
-        self.mode = "dequantize"
-        for param_name in self.params:
-            param = self.params[param_name]
+        for name in self.param_names:
+            param = self.params[name]
             sinfo = param.param_info
             assert isinstance(sinfo, relax.TensorStructInfo)
             shape = sinfo.shape
             assert isinstance(shape, relax.ShapeExpr)
             new_shape = relax.ShapeExpr([shape.values[i] if i != param.shard_dim else shape.values[i] * self.worker_num for i in range(len(shape.values))])
             param.param_info = relax.TensorStructInfo(new_shape, sinfo.dtype, sinfo.vdevice)
+            
+        print("convert weight")
+        
+    def to_dequantize_mode(self):
+        if self.mode == "dequantize":
+            return
+        self.mode = "dequantize"
+        for name in self.param_names:
+            param = self.params[name]
+            sinfo = param.param_info
+            assert isinstance(sinfo, relax.TensorStructInfo)
+            shape = sinfo.shape
+            assert isinstance(shape, relax.ShapeExpr)
+            new_shape = relax.ShapeExpr([shape.values[i] if i != param.shard_dim else shape.values[i] // self.worker_num for i in range(len(shape.values))])
+            param.param_info = relax.TensorStructInfo(new_shape, sinfo.dtype, sinfo.vdevice)
 
-
+        print("dequantize")
+        for name in self.param_names:
+            param = self.params[name]
+            sinfo = param.param_info
+            print(sinfo)
 @mutator
 class ParamReplacer(PyExprMutator):
     """The function mutator that updates the model with dequantization.
@@ -876,6 +885,7 @@ def create_quantize_func(param_manager: ParamManager) -> tvm.IRModule:
     Precisely, an IRModule which contains the main quantization Relax function
     and a series of TIR functions is returned.
     """
+    param_manager.to_convert_weight_mode()
     bb = relax.BlockBuilder()
     param2qrange = dict()
 

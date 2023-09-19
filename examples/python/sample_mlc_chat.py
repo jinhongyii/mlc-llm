@@ -5,7 +5,7 @@ from mlc_chat.callback import StreamToStdout
 # $ python examples/python/sample_mlc_chat.py
 
 # Create a ChatModule instance
-cm = ChatModule(model="Llama-2-7b-chat-hf-q4f16_1")
+cm = ChatModule(model="Llama-2-70b-chat-hf-q4f16_1")
 # You can change to other models that you downloaded, for example,
 # cm = ChatModule(model="Llama-2-13b-chat-hf-q4f16_1")  # Llama2 13b model
 

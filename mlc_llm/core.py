@@ -375,6 +375,7 @@ def mod_transform_before_build(
         if args.model.lower().startswith("rwkv-"):
             model_names += ["reset_kv_cache"]
 
+    utils.debug_dump_script(mod, "mod_before_transform.py", args)
     mod = param_manager.transform_dequantize(mod)
 
     use_ft_quant = args.quantization.name in ["q4f16_ft", "q8f16_ft"]
@@ -459,6 +460,17 @@ def mod_transform_before_build(
             )(mod)
 
     mod = mlc_llm.transform.FuseTransposeMatmul()(mod)
+    # mod = relax.transform.LegalizeOps()(mod)
+    # utils.debug_dump_script(mod, "before_propagate.py", args)
+    # sharded_mod = relax.distributed.transform.PropagateSharding()(mod)
+    # utils.debug_dump_script(sharded_mod, "mod_sharded.py", args)
+    # sharded_mod = relax.distributed.transform.LowerGlobalViewToLocalView()(sharded_mod)
+    # utils.debug_dump_script(sharded_mod, "mod_sharded_local_view.py", args)
+    # sharded_mod = relax.distributed.transform.LowerDistIR()(sharded_mod)
+    # utils.debug_dump_script(sharded_mod, "mod_lowered_distir.py", args)
+    # mod = sharded_mod
+    # mod = relax.transform.LiftTransformParams()(mod)
+    # mod = relax.transform.BundleModelParams()(mod)
     mod = relax.pipeline.get_pipeline()(mod)  # pylint: disable=no-value-for-parameter
     mod = mlc_llm.transform.FuseDecodeMatmulEwise()(mod)
     mod = mlc_llm.transform.FuseDecodeTake()(mod)

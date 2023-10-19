@@ -7,6 +7,7 @@ import tvm
 from tvm import relax, te
 from tvm.relax.op import ccl
 from tvm.relax.testing import nn
+from tvm.relax.distributed import device_mesh, Placement
 from tvm.script import relax as R
 
 from ..quantization import ParamQuantKind, QuantizationScheme
@@ -57,10 +58,8 @@ class LlamaConfig:
         self.tie_word_embeddings = tie_word_embeddings
         self.position_embedding_base = position_embedding_base
         self.combine_matmul = combine_matmul
-        if build_model_only and num_shards > 1:
-            self.num_shards = num_shards
-        else:
-            self.num_shards = 1
+        self.num_shards = num_shards
+        self.device_mesh = device_mesh([num_shards,], list(range(num_shards)))
         self.kwargs = kwargs
 
 
@@ -147,15 +146,12 @@ class LlamaMLP(nn.Module):
         self.combine_matmul = config.combine_matmul
         self.num_shards = config.num_shards
         hidden_size = config.hidden_size
-        intermediate_size = config.intermediate_size // self.num_shards
+        intermediate_size = config.intermediate_size 
         dtype = config.dtype
+        self.device_mesh_for_tp = config.device_mesh
         if self.combine_matmul:
             self.gate_up_proj = Linear(hidden_size, 2 * intermediate_size, dtype=dtype, bias=False)
             self.down_proj = Linear(intermediate_size, hidden_size, dtype=dtype, bias=False)
-            self.gate_up_proj.weight.shard_dim = 0
-            self.gate_up_proj.weight.shard_strategy = "shard_gate_up"
-            self.down_proj.weight.shard_dim = 1
-            self.down_proj.weight.shard_strategy = "shard_mlp_k"
         else:
             self.gate_proj = Linear(hidden_size, intermediate_size, dtype=dtype, bias=False)
             self.down_proj = Linear(intermediate_size, hidden_size, dtype=dtype, bias=False)
@@ -175,7 +171,8 @@ class LlamaMLP(nn.Module):
         else:
             gate_result = self.gate_proj(x)
             up_result = self.up_proj(x)
-
+        if self.num_shards >1:
+            gate_result = relax.op.distributed.annotate_sharding(gate_result, self.device_mesh_for_tp, Placement.from_text("S[2]"))
         result = self.down_proj(relax.op.nn.silu(gate_result) * up_result)
         return result
 
@@ -222,11 +219,11 @@ class LlamaAttention(nn.Module):
             config.num_key_value_heads is None
             and config.num_attention_heads
             or config.num_key_value_heads
-        ) // config.num_shards
-        self.num_query_heads = config.num_attention_heads // self.num_shards
+        )
+        self.num_query_heads = config.num_attention_heads 
         self.head_dim = self.hidden_size // config.num_attention_heads
         self.position_embedding_base = config.position_embedding_base
-
+        self.device_mesh_for_tp = config.device_mesh
         self.combine_matmul = config.combine_matmul
         if self.combine_matmul:
             self.query_key_value_proj = Linear(
@@ -235,8 +232,6 @@ class LlamaAttention(nn.Module):
                 dtype=dtype,
                 bias=False,
             )
-            self.query_key_value_proj.weight.shard_dim = 0
-            self.query_key_value_proj.weight.shard_strategy = "shard_qkv"
         else:
             self.q_proj = Linear(
                 self.hidden_size,
@@ -256,15 +251,10 @@ class LlamaAttention(nn.Module):
                 dtype=dtype,
                 bias=False,
             )
-            self.q_proj.weight.shard_dim = 0
-            self.k_proj.weight.shard_dim = 0
-            self.v_proj.weight.shard_dim = 0
 
         self.o_proj = Linear(
             self.head_dim * self.num_query_heads, self.hidden_size, dtype=dtype, bias=False
         )
-        self.o_proj.weight.shard_dim = 1
-        self.o_proj.weight.shard_strategy = "shard_o_proj_k"
 
     def forward(
         self,
@@ -312,19 +302,24 @@ class LlamaAttention(nn.Module):
                 (bsz, q_len, self.num_query_heads, self.head_dim),
             ),
         )
+        if self.num_shards>1:
+            query_states = nn.emit(relax.op.distributed.annotate_sharding(query_states, self.device_mesh_for_tp, Placement.from_text("S[2]")))
         key_states = nn.emit(
             reshape(
                 key_states,
                 (bsz, q_len, self.num_key_value_heads, self.head_dim),
             ),
         )
+        if self.num_shards>1:
+            key_states = nn.emit(relax.op.distributed.annotate_sharding(key_states, self.device_mesh_for_tp, Placement.from_text("S[2]")))
         value_states = nn.emit(
             reshape(
                 value_states,
                 (bsz, q_len, self.num_key_value_heads, self.head_dim),
             ),
         )
-
+        if self.num_shards>1:
+            value_states = nn.emit(relax.op.distributed.annotate_sharding(value_states, self.device_mesh_for_tp, Placement.from_text("S[2]")))
         kv_seq_len = all_seq_len_shape.struct_info.values[0]
         offset = kv_seq_len - q_len
         query_states, key_states = apply_rotary_pos_emb(
@@ -456,25 +451,16 @@ class LlamaDecoderLayer(nn.Module):
             attention_mask=attention_mask,
             all_seq_len_shape=all_seq_len_shape,
         )
-        if self.self_attn.num_shards > 1:
-            residual = nn.emit(
-                residual / R.const(self.self_attn.num_shards, dtype=residual.struct_info.dtype)
-            )
+
         hidden_states = nn.emit(residual + hidden_states)
-        if self.self_attn.num_shards > 1:
-            hidden_states = nn.emit(ccl.allreduce(hidden_states, "sum"))
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        if self.mlp.num_shards > 1:
-            residual = nn.emit(
-                residual / R.const(self.mlp.num_shards, dtype=residual.struct_info.dtype)
-            )
+
         hidden_states = nn.emit(residual + hidden_states)
-        if self.mlp.num_shards > 1:
-            hidden_states = nn.emit(ccl.allreduce(hidden_states, "sum"))
+
         return hidden_states, present_key_value
 
 
@@ -567,8 +553,7 @@ class LlamaModel(nn.Module):
         all_seq_len_shape: relax.Expr,
         past_key_values: relax.Expr,
     ):
-        if self.num_shards > 1:
-            inputs = nn.emit(ccl.broadcast_from_worker0(inputs))
+
         if self.embed_tokens:
             inputs_embeds = self.embed_tokens(inputs)
         else:
@@ -617,9 +602,9 @@ class LlamaForCausalLM(nn.Module):
 
         # Set the cached sin/cos to the maximum of 2048 and max seq len.
         # This will be eliminated further with online rotary embedding calculation.
-        cache_len = te.var("cache_len", "int64")
-        self.cos_cached = nn.Parameter((cache_len, head_dim), dtype=config.dtype, name="cos_cached")
-        self.sin_cached = nn.Parameter((cache_len, head_dim), dtype=config.dtype, name="sin_cached")
+        # cache_len = te.var("cache_len", "int64")
+        # self.cos_cached = nn.Parameter((cache_len, head_dim), dtype=config.dtype, name="cos_cached")
+        # self.sin_cached = nn.Parameter((cache_len, head_dim), dtype=config.dtype, name="sin_cached")
         ############ End ############
 
     def forward(
@@ -776,7 +761,7 @@ def create_kv_cache_func(bb: relax.BlockBuilder, config: LlamaConfig) -> None:
         config.num_attention_heads
         if config.num_key_value_heads is None
         else config.num_key_value_heads
-    ) // config.num_shards
+    ) 
     init_shape = relax.ShapeExpr(
         (
             config.max_sequence_length,
@@ -831,7 +816,7 @@ def get_model(args, hf_config):
         **hf_config,
         dtype=dtype,
         position_embedding_base=position_embedding_base,
-        combine_matmul=True,
+        combine_matmul=False,
         num_shards=args.num_shards,
         build_model_only=args.build_model_only,
     )
@@ -866,6 +851,8 @@ def get_model(args, hf_config):
                     "m": config.max_sequence_length,
                 },
             )
+    if args.num_shards > 1:
+        mod.update_global_info("mesh", [config.device_mesh])
 
     if args.build_model_only:
         return mod, param_manager, None, config

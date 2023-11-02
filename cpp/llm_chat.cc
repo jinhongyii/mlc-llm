@@ -178,12 +178,10 @@ struct FunctionTable {
       std::string metadata_path = (fs_model_path / "ndarray-cache.json").string();
       std::string ndarray_cache_metadata = LoadBytesFromFile(metadata_path);
       PackedFunc loader_create = this->get_global_func("runtime.disco.ShardLoader");
-      PackedFunc loader_load_all = this->get_global_func("runtime.disco.ShardLoaderLoadAll");
       CHECK(loader_create != nullptr);
-      CHECK(loader_load_all != nullptr);
       DRef loader = loader_create(metadata_path, ndarray_cache_metadata, "", this->disco_mod);
-      DRef params = loader_load_all(loader);
-      return params;
+      PackedFunc ftransform_params = mod_get_func("decode_transform_params");
+      return ftransform_params(loader);
     } else {
       const PackedFunc* fload_cache = tvm::runtime::Registry::Get("vm.builtin.ndarray_cache.load");
       ICHECK(fload_cache) << "TVM runtime cannot find vm.builtin.ndarray_cache.load";

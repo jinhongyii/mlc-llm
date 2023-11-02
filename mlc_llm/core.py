@@ -446,8 +446,9 @@ def mod_transform_before_build(
         if args.model.lower().startswith("rwkv-"):
             model_names += ["reset_kv_cache"]
 
+    utils.debug_dump_script(mod, "mod_before_transform.py", args)
     mod = param_manager.transform_dequantize()(mod)
-    mod = relax.transform.BundleModelParams()(mod)
+    utils.debug_dump_script(mod, "mod_dequantize.py", args)
 
     use_ft_quant = args.quantization.name in ["q4f16_ft", "q8f16_ft"]
     mod = mlc_llm.transform.FuseDecodeTranspose(skip_gemm=not use_ft_quant)(mod)
@@ -524,10 +525,30 @@ def mod_transform_before_build(
             )(mod)
 
     mod = mlc_llm.transform.FuseTransposeMatmul()(mod)
+    mod = relax.transform.LegalizeOps()(mod)
+    if args.num_shards > 1:
+        utils.debug_dump_script(mod, "before_propagate.py", args)
+        sharded_mod = relax.distributed.transform.PropagateSharding()(mod)
+        utils.debug_dump_script(sharded_mod, "mod_sharded.py", args)
+        sharded_mod = relax.distributed.transform.LowerGlobalViewToLocalView()(sharded_mod)
+        utils.debug_dump_script(sharded_mod, "mod_sharded_local_view.py", args)
+        sharded_mod = relax.distributed.transform.LowerDistIR()(sharded_mod)
+        utils.debug_dump_script(sharded_mod, "mod_lowered_distir.py", args)
+        mod = sharded_mod
+    mod = relax.transform.LiftTransformParams()(mod)
+    mod = relax.transform.BundleModelParams()(mod)
+    tvm.ir.assert_structural_equal(mod["prefill_transform_params"].without_attr("global_symbol"), mod["decode_transform_params"].without_attr("global_symbol"))
+    utils.debug_dump_script(mod, "mod_lift_transform_params.py", args)
     mod = relax.pipeline.get_pipeline()(mod)  # pylint: disable=no-value-for-parameter
     mod = mlc_llm.transform.FuseDecodeMatmulEwise()(mod)
     mod = mlc_llm.transform.FuseDecodeTake()(mod)
     mod = relax.transform.DeadCodeElimination(model_names)(mod)
+    if args.num_shards > 1:
+        utils.debug_dump_script(mod, "mod_before_lazy_transform.py", args)
+        mod = relax.transform.ToNonDataflow()(mod)
+        mod = relax.transform.RemovePurityChecking()(mod)
+        mod = relax.transform.LazyTransformParams(fget_item="runtime.disco.ShardLoaderLoadWithoutShard", fset_item=None, get_item_param=[relax.Var("loader", relax.ObjectStructInfo())])(mod)
+        utils.debug_dump_script(mod, "mod_lazy_transform.py", args)
     mod = mlc_llm.transform.CleanUpTIRAttrs()(mod)
     mod_deploy = mod
 
@@ -606,11 +627,14 @@ def build(mod_deploy: tvm.IRModule, args: argparse.Namespace) -> None:
                 dl.gpu.GeneralReduction(),
                 dl.gpu.Fallback(),
             )(mod_deploy)
+            utils.debug_dump_script(mod_deploy, "mod_after_dlight.py", args)
+
             mod_deploy = (
                 mlc_llm.transform.LiftTIRGlobalBufferAlloc()(  # pylint: disable=not-callable
                     mod_deploy
                 )
             )
+            utils.debug_dump_script(mod_deploy, "mod_after_lift_tir_global_buffer_alloc.py", args)
             mod_deploy = tvm.tir.transform.ForceNarrowIndexToInt32()(mod_deploy)
 
     if args.debug_load_script:

@@ -742,7 +742,8 @@ class ParamManager:
             return qparams[0]
         else:
             # Apply the dequantization function.
-            return bb.emit(f_dequantize(bb, qparams))
+            qparams_new = [bb.emit(relax.op.builtin.stop_lift_params(qparam)) for qparam in qparams]
+            return bb.emit(f_dequantize(bb, qparams_new))
 
     def create_parameter_transformation(self, optimize_parameter_order: bool = True):
         """Produce an IRModule that can transform the parameters

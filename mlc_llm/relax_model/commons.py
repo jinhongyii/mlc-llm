@@ -80,7 +80,7 @@ def create_shard_info_func(mod, param_manager, args, model_config):
         dtype = str(buffer.dtype)
         shard_info_dict[param_name] = [(func_name, [shape, dtype])]
 
-    q_params = param_manager.get_quantized_param_info("prefill").fields
+    q_params = param_manager.get_quantized_param_info("prefill")
     for _, param in param_manager.params.items():
         if param.shard_strategy is None:
             pass

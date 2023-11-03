@@ -188,8 +188,10 @@ struct FunctionTable {
       (*fload_cache)(model_path, static_cast<int32_t>(device.device_type), device.device_id);
       const PackedFunc* fload_params =
           tvm::runtime::Registry::Get("vm.builtin.param_array_from_cache");
-      ICHECK(fload_params) << "Cannot find env function vm.builtin.param_array_from_cache";
+      ICHECK(fload_params) << "Cannot find env function vm.builtin.param_array_from_cache";      
       Array<NDArray> params = (*fload_params)("param", -1);
+      PackedFunc ftransform_params = mod_get_func("decode_transform_params");
+      params = ftransform_params(params);
       // after we get params, it is safe to simply clear the cached version
       // as these params are referenced by params_
       const PackedFunc* fclear_ndarray_cache =

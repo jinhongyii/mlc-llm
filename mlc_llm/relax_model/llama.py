@@ -1339,22 +1339,23 @@ def get_model(args, hf_config):
     mod = bb.get()
     for gv in mod.functions:
         func = mod[gv]
-        func = func.with_attr(
-                {
-                    "tir_var_upper_bound":
+        if isinstance(func, relax.Function):
+            func = func.with_attr(
                     {
-                        "n": config.max_sequence_length,
-                        "m": config.max_sequence_length,
+                        "tir_var_upper_bound":
+                        {
+                            "n": config.max_sequence_length,
+                            "m": config.max_sequence_length,
+                        }
+                    })
+            if gv in ["decode", "prefill"]:
+                mod[gv] = func.with_attr(
+                    {
+                        "num_input": 3
                     }
-                })
-        if isinstance(func, relax.Function) and gv in ["decode", "prefill"]:
-            mod[gv] = func.with_attr(
-                {
-                    "num_input": 3
-                }
-            )
-        else:
-            mod[gv] = func
+                )
+            else:
+                mod[gv] = func
     if args.num_shards > 1:
         mod.update_global_info("mesh", [config.device_mesh])
     if args.build_model_only:

@@ -535,6 +535,9 @@ def mod_transform_before_build(
         sharded_mod = relax.distributed.transform.LowerDistIR()(sharded_mod)
         utils.debug_dump_script(sharded_mod, "mod_lowered_distir.py", args)
         mod = sharded_mod
+    utils.debug_dump_script(mod, "mod_before_combine_qkv.py", args)
+    mod = mlc_llm.transform.combine_qkv()(mod)
+    utils.debug_dump_script(mod, "mod_combine_qkv.py", args)
     mod = relax.transform.LiftTransformParams()(mod)
     mod = relax.transform.BundleModelParams()(mod)
     tvm.ir.assert_structural_equal(mod["prefill_transform_params"].without_attr("global_symbol"), mod["decode_transform_params"].without_attr("global_symbol"))

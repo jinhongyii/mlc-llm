@@ -181,25 +181,27 @@ def fuse_split_rotary_embedding(
             pat_flat_fused_qkv = wildcard()
             pat_offset = wildcard()
 
-            # query_shape = is_shape([1, seq_len, num_query_heads, head_dim])
-            pat_query_shape = wildcard()
-            # value_shape = is_shape([1, seq_len, num_kv_heads, head_dim])
-            pat_key_shape = wildcard()
-            # value_shape = is_shape([1, seq_len, num_kv_heads, head_dim])
-            pat_value_shape = wildcard()
-
             pat_flat_qkv_tuple = is_op("relax.split")(pat_flat_fused_qkv)
             pat_flat_query = is_tuple_get_item(pat_flat_qkv_tuple, 0)
-            pat_query = is_op("relax.reshape")(
-                pat_flat_query, pat_query_shape, add_constraint=False
+            pat_reshape_gvar = GlobalVarPattern()
+            pat_query = is_op("relax.call_tir")(
+                pat_reshape_gvar, 
+                TuplePattern([pat_flat_query]),
+                add_constraint=False,
             )
             pat_flat_query.used_by(pat_query)
             pat_flat_key = is_tuple_get_item(pat_flat_qkv_tuple, 1)
-            pat_key = is_op("relax.reshape")(pat_flat_key, pat_key_shape, add_constraint=False)
+            pat_key = is_op("relax.call_tir")(
+                pat_reshape_gvar, 
+                TuplePattern([pat_flat_key]),
+                add_constraint=False,
+            )
             pat_flat_key.used_by(pat_key)
             pat_flat_value = is_tuple_get_item(pat_flat_qkv_tuple, 2)
-            pat_value = is_op("relax.reshape")(
-                pat_flat_value, pat_value_shape, add_constraint=False
+            pat_value = is_op("relax.call_tir")(
+                pat_reshape_gvar, 
+                TuplePattern([pat_flat_value]),
+                add_constraint=False,
             )
             pat_flat_value.used_by(pat_value)
 
@@ -223,6 +225,7 @@ def fuse_split_rotary_embedding(
             pat_key.used_by(pat_embedded_key)
 
         def rewriter(matchings, bindings):
+            print("matched")
             # Extracting all the relax and TIR variables that we'll need
             flat_fused_qkv = matchings[pat_flat_fused_qkv]
             flat_qkv_tuple = matchings[pat_flat_qkv_tuple]

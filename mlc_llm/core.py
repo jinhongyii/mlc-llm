@@ -453,28 +453,6 @@ def mod_transform_before_build(
     use_ft_quant = args.quantization.name in ["q4f16_ft", "q8f16_ft"]
     mod = mlc_llm.transform.FuseDecodeTranspose(skip_gemm=not use_ft_quant)(mod)
 
-    if (
-        not args.enable_batching
-        and hasattr(config, "num_attention_heads")
-        and hasattr(config, "hidden_size")
-        and hasattr(config, "position_embedding_base")
-        and getattr(config, "dtype", "float16") == "float16"
-    ):
-        max_seq_len = None
-        if args.max_seq_len > 0:
-            max_seq_len = args.max_seq_len
-        elif hasattr(config, "max_sequence_length"):
-            max_seq_len = config.max_sequence_length
-
-        if max_seq_len:
-            num_key_value_heads = config.get_num_key_value_heads()
-            mod = fuse_split_rotary_embedding(
-                    config.num_attention_heads // args.num_shards,
-                    num_key_value_heads // args.num_shards,
-                    config.hidden_size // args.num_shards,
-                    config.position_embedding_base,
-                )(mod)
-
     if args.target_kind == "cuda":
         patterns = []
 
@@ -538,6 +516,28 @@ def mod_transform_before_build(
     utils.debug_dump_script(mod, "mod_before_combine_qkv.py", args)
     mod = mlc_llm.transform.combine_qkv()(mod)
     utils.debug_dump_script(mod, "mod_combine_qkv.py", args)
+    
+    if (
+        not args.enable_batching
+        and hasattr(config, "num_attention_heads")
+        and hasattr(config, "hidden_size")
+        and hasattr(config, "position_embedding_base")
+        and getattr(config, "dtype", "float16") == "float16"
+    ):
+        max_seq_len = None
+        if args.max_seq_len > 0:
+            max_seq_len = args.max_seq_len
+        elif hasattr(config, "max_sequence_length"):
+            max_seq_len = config.max_sequence_length
+
+        if max_seq_len:
+            num_key_value_heads = config.get_num_key_value_heads()
+            mod = fuse_split_rotary_embedding(
+                    config.num_attention_heads // args.num_shards,
+                    num_key_value_heads // args.num_shards,
+                    config.hidden_size // args.num_shards,
+                    config.position_embedding_base,
+                )(mod)
     mod = relax.transform.LiftTransformParams()(mod)
     mod = relax.transform.BundleModelParams()(mod)
     tvm.ir.assert_structural_equal(mod["prefill_transform_params"].without_attr("global_symbol"), mod["decode_transform_params"].without_attr("global_symbol"))

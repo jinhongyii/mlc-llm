@@ -548,8 +548,13 @@ def mod_transform_before_build(
     mod = relax.transform.DeadCodeElimination(model_names)(mod)
     if args.num_shards > 1:
         utils.debug_dump_script(mod, "mod_before_lazy_transform.py", args)
-        mod = relax.transform.ToNonDataflow()(mod)
-        mod = relax.transform.RemovePurityChecking()(mod)
+        for gvar, func in mod.functions.items():
+            if "transform_params" in gvar.name_hint:
+                temp_mod = tvm.IRModule()
+                temp_mod["main"] = func
+                temp_mod = relax.transform.ToNonDataflow()(temp_mod)
+                temp_mod = relax.transform.RemovePurityChecking()(temp_mod)
+                mod[gvar] = temp_mod["main"]
         mod = relax.transform.LazyTransformParams(fget_item="runtime.disco.ShardLoaderLoadWithoutShard", fset_item=None, get_item_param=[relax.Var("loader", relax.ObjectStructInfo())])(mod)
         utils.debug_dump_script(mod, "mod_lazy_transform.py", args)
     mod = mlc_llm.transform.CleanUpTIRAttrs()(mod)

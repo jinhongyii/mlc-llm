@@ -225,7 +225,6 @@ def fuse_split_rotary_embedding(
             pat_key.used_by(pat_embedded_key)
 
         def rewriter(matchings, bindings):
-            print("matched")
             # Extracting all the relax and TIR variables that we'll need
             flat_fused_qkv = matchings[pat_flat_fused_qkv]
             flat_qkv_tuple = matchings[pat_flat_qkv_tuple]

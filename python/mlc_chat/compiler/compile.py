@@ -96,7 +96,14 @@ def _attach_variable_bounds(mod, model_config):
         if isinstance(func, relax.Function):
             mod[g_var] = func.with_attr("tir_var_upper_bound", tir_bound_map)
 
-
+def debug_dump_script(mod, name):
+    """Debug dump mode"""
+    import os
+    dump_path = os.path.join("debug", name)
+    with open(dump_path, "w", encoding="utf-8") as outfile:
+        outfile.write(mod.script())
+        
+    print(f"Dump mod to {dump_path}")
 def _compile(args: CompileArgs):
     logger.info("Creating model from: %s", args.config)
     model_config = args.model.config.from_file(args.config)
@@ -110,6 +117,7 @@ def _compile(args: CompileArgs):
     _attach_variable_bounds(mod, model_config)
     with args.target:
         mod = relax.get_pipeline("mlc_llm")(mod)
+    debug_dump_script(mod, "after_build.py")
     _attach_auxiliary_methods(mod, named_params, args)
     logger.info("Generating code using TVM Unity")
     args.build_func(mod, args)

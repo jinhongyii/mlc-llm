@@ -24,6 +24,8 @@ class MistralConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     hidden_size: int
     intermediate_size: int
     num_attention_heads: int
+    num_experts: int
+    num_experts_per_token: int
     num_hidden_layers: int
     rms_norm_eps: float
     vocab_size: int
@@ -134,6 +136,298 @@ class MistralMLP(nn.Module):
         concat_x1_x2 = self.gate_up_proj(x)
         x1, x2 = op.split(concat_x1_x2, 2, axis=-1)
         return self.down_proj(op.silu(x1) * x2)
+
+
+class MistralExperts(nn.Module):
+    def __init__(self, num_experts, in_features, out_features):
+        self.num_experts = num_experts
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter((num_experts, out_features, in_features))
+
+    def forward(self, x: Tensor, indptr: Tensor):
+        from tvm import relax
+
+        assert x.ndim == 2
+        bb = relax.BlockBuilder.current()
+
+        return op._wrap_nested(
+            bb.emit(
+                relax.call_dps_packed(
+                    "torch.groupgemm",
+                    [x._expr, self.weight._expr, indptr._expr],
+                    out_sinfo=relax.TensorStructInfo(
+                        (x.shape[0], self.out_features), self.weight.dtype
+                    ),
+                )
+            ),
+            name="groupgemm",
+        )
+
+
+class MistralMoE(nn.Module):
+    def __init__(self, config: MistralConfig):
+        super().__init__()
+        self.gate = nn.Linear(
+            in_features=config.hidden_size, out_features=config.num_experts, bias=False
+        )
+        self.num_experts_per_token = config.num_experts_per_token
+        self.num_experts = config.num_experts
+        self.e1_e3 = MistralExperts(
+            self.num_experts,
+            in_features=config.hidden_size,
+            out_features=2 * config.intermediate_size,
+        )
+        self.e2 = MistralExperts(
+            self.num_experts,
+            in_features=config.intermediate_size,
+            out_features=config.hidden_size,
+        )
+        self.dtype = "float32"
+
+    def topk_mask(self, topk_indices: Tensor) -> Tensor:
+        from functools import reduce
+
+        def te_topk_mask_op(topk_indices):
+            ntokens = topk_indices.shape[0]
+            assert topk_indices.shape[1] == self.num_experts_per_token
+            return te.compute(
+                (ntokens, self.num_experts),
+                lambda i, j: tir.expr.Select(
+                    reduce(
+                        lambda a, b: tir.Or(a, b),
+                        [topk_indices[i, k] == j for k in range(self.num_experts_per_token)],
+                    ),
+                    true_value=tir.const(1, "int32"),
+                    false_value=tir.const(0, "int32"),
+                ),
+            )
+
+        return op.tensor_expr_op(te_topk_mask_op, "topk_mask", args=[topk_indices])
+
+    def get_indices(self, cumsum_colwise_flattened: Tensor, expert_indices: Tensor) -> Tensor:
+        from tvm import relax
+        from tvm.script import tir as T
+
+        @T.prim_func
+        def get_flattened_expert_indices_scheduled(
+            var_cumsum_colwise_flattened: T.handle,
+            var_expert_indices: T.handle,
+            var_flattened_expert_indices: T.handle,
+        ):
+            T.func_attr({"tir.is_scheduled": 1})
+            batch_size = T.SizeVar("batch_size", "int32")
+            cumsum_flattened_length = T.SizeVar("cumsum_flattened_length", "int32")
+
+            cumsum_colwise_flattened = T.match_buffer(
+                var_cumsum_colwise_flattened, shape=[cumsum_flattened_length], dtype="int32"
+            )
+            expert_indices = T.match_buffer(
+                var_expert_indices, shape=[batch_size, self.num_experts_per_token], dtype="int32"
+            )
+            flattened_expert_indices = T.match_buffer(
+                var_flattened_expert_indices,
+                shape=[batch_size * self.num_experts_per_token],
+                dtype="int32",
+            )
+
+            for io in T.thread_binding(
+                0, T.floordiv(cumsum_flattened_length, T.int32(1024)), "blockIdx.x"
+            ):
+                for ii in T.thread_binding(0, T.int32(1024), "threadIdx.x"):
+                    with T.block("get_indices"):
+                        vi = T.axis.spatial(cumsum_flattened_length, io * T.int32(1024) + ii)
+                        T.where(io * T.int32(1024) + ii < cumsum_flattened_length)
+                        T.reads(
+                            cumsum_colwise_flattened[vi - 1 : vi - 1 + 2], expert_indices[:, 0:2]
+                        )
+                        T.writes(flattened_expert_indices[:])
+                        expert_idx = T.alloc_buffer(shape=(), dtype="int32", scope="local")
+                        if (
+                            vi == 0 and cumsum_colwise_flattened[vi] > 0
+                        ) or cumsum_colwise_flattened[vi] != cumsum_colwise_flattened[vi - 1]:
+                            idx: T.SizeVar("idx", "int32") = cumsum_colwise_flattened[vi] - 1
+                            instance_id: T.SizeVar("instance_id", "int32") = T.truncmod(
+                                vi, batch_size
+                            )
+                            expert_id: T.SizeVar("expert_id", "int32") = T.truncdiv(vi, batch_size)
+                            for j in T.serial(0, self.num_experts_per_token):
+                                with T.block("select_expert"):
+                                    vj = T.axis.spatial(self.num_experts_per_token, j)
+                                    vinstance_id = T.axis.spatial(batch_size, instance_id)
+                                    vexpert_id = T.axis.spatial(
+                                        T.truncdiv(cumsum_flattened_length, batch_size), expert_id
+                                    )
+                                    if expert_indices[vinstance_id, vj] == vexpert_id:
+                                        expert_idx[()] = vj
+                            flattened_expert_indices[idx] = (
+                                instance_id * self.num_experts_per_token + expert_idx[()]
+                            )
+
+        bb = relax.BlockBuilder.current()
+        gvar = bb.add_func(get_flattened_expert_indices_scheduled, "get_flattened_expert_indices")
+        return op._wrap_nested(
+            bb.emit(
+                relax.call_tir(
+                    gvar,
+                    [cumsum_colwise_flattened._expr, expert_indices._expr],
+                    out_sinfo=relax.TensorStructInfo(
+                        [expert_indices.shape[0] * self.num_experts_per_token], "int32"
+                    ),
+                )
+            ),
+            name="flattened_expert_indices",
+        )
+
+    def get_indptr(self, cumsum_colwise_flattened: Tensor) -> Tensor:
+        from tvm import relax
+        from tvm.script import tir as T
+
+        @T.prim_func
+        def get_expert_instance_indptr(
+            var_cumsum_colwise_flattened: T.handle,
+            var_expert_instance_indptr: T.handle,
+            batch_size: T.int32,
+        ):
+            cumsum_colwise_flattened = T.match_buffer(
+                var_cumsum_colwise_flattened, shape=[batch_size * self.num_experts], dtype="int32"
+            )
+            expert_instance_indptr = T.match_buffer(
+                var_expert_instance_indptr, shape=[self.num_experts + 1], dtype="int32"
+            )
+
+            for expert_id in T.serial(0, self.num_experts + 1):
+                with T.block("indptr"):
+                    vexpert_id = T.axis.spatial(self.num_experts + 1, expert_id)
+                    expert_instance_indptr[vexpert_id] = T.Select(
+                        condition=vexpert_id > 0,
+                        true_value=cumsum_colwise_flattened[vexpert_id * batch_size - 1],
+                        false_value=T.int32(0),
+                    )
+
+        bb = relax.BlockBuilder.current()
+        gvar = bb.add_func(get_expert_instance_indptr, "get_expert_instance_indptr")
+        return op._wrap_nested(
+            bb.emit(
+                relax.call_tir(
+                    gvar,
+                    [cumsum_colwise_flattened._expr],
+                    out_sinfo=relax.TensorStructInfo([self.num_experts + 1], "int32"),
+                    tir_vars=[cumsum_colwise_flattened.shape[0] // self.num_experts],
+                )
+            ),
+            name="expert_instance_indptr",
+        )
+
+    def scatter_output(self, flattened_indices: Tensor, linear_out: Tensor) -> Tensor:
+        from tvm import relax
+        from tvm.script import tir as T
+
+        @T.prim_func
+        def tir_scatter_output(
+            var_unscattered_output: T.handle,
+            var_flattened_expert_indices: T.handle,
+            var_scattered_output: T.handle,
+        ):
+            out_features = T.int32()
+            flattened_indices_length = T.int32()
+
+            unscattered_output = T.match_buffer(
+                var_unscattered_output,
+                shape=[flattened_indices_length, out_features],
+                dtype=self.dtype,
+            )
+            flattened_expert_indices = T.match_buffer(
+                var_flattened_expert_indices, shape=[flattened_indices_length], dtype="int32"
+            )
+            scattered_output = T.match_buffer(
+                var_scattered_output,
+                shape=[flattened_indices_length, out_features],
+                dtype=self.dtype,
+            )
+
+            for i in T.serial(0, flattened_indices_length):
+                for j in T.serial(0, out_features):
+                    with T.block("scatter"):
+                        vi, vj = T.axis.remap("SS", [i, j])
+                        scattered_output[flattened_expert_indices[vi], vj] = unscattered_output[
+                            vi, vj
+                        ]
+
+        bb = relax.BlockBuilder.current()
+        gvar = bb.add_func(tir_scatter_output, "scatter_output")
+        return op._wrap_nested(
+            bb.emit(
+                relax.call_tir(
+                    gvar,
+                    [linear_out._expr, flattened_indices._expr],
+                    out_sinfo=linear_out._expr.struct_info,
+                )
+            ),
+            name="scatter_output",
+        )
+
+    def forward(self, x: Tensor):
+        from tvm import relax
+
+        assert x.ndim == 3
+        input_shape = x.shape
+        x = op.reshape(x, (input_shape[0] * input_shape[1], input_shape[2]))
+        num_tokens = input_shape[0] * input_shape[1]
+        bb = relax.BlockBuilder.current()
+
+        # MoE data preparation
+        gate: Tensor = self.gate(x)
+        expert_weights, expert_indices = op._wrap_nested(
+            bb.emit(
+                relax.op.call_dps_packed(
+                    "torch.topk",
+                    [gate._expr, self.num_experts_per_token],
+                    out_sinfo=[
+                        relax.TensorStructInfo([num_tokens, self.num_experts_per_token], x.dtype),
+                        relax.TensorStructInfo([num_tokens, self.num_experts_per_token], "int32"),
+                    ],
+                )
+            ),
+            name="topk",
+        )
+        expert_weights = op.softmax(expert_weights, axis=-1)
+        expert_mask = self.topk_mask(expert_indices)
+        mask_T_flattened = op.reshape(
+            op.permute_dims(expert_mask), (expert_mask.shape[0] * expert_mask.shape[1],)
+        )
+        cumsum_colwise_flattened = op._wrap_nested(
+            bb.emit(
+                relax.op.call_dps_packed(
+                    "torch.cumsum",
+                    [mask_T_flattened._expr, 0],
+                    out_sinfo=relax.TensorStructInfo([num_tokens * self.num_experts], "int32"),
+                )
+            ),
+            name="cumsum",
+        )
+        flattened_indices = self.get_indices(cumsum_colwise_flattened, expert_indices)
+        indptr = self.get_indptr(cumsum_colwise_flattened)
+        token_indices = op.divide(flattened_indices, Tensor.from_const(self.num_experts_per_token))
+        gathered_x = op.take(x, token_indices, axis=0)
+
+        # MLP forward begin
+        concat_x1_x3 = self.e1_e3(gathered_x, indptr)
+        x1, x3 = op.split(concat_x1_x3, indices_or_sections=2, axis=-1)
+        linear_out = self.e2(op.silu(x1) * x3, indptr)
+        # MLP forward end
+
+        # MoE result post-processing
+        unpermuted = self.scatter_output(flattened_indices, linear_out)
+        unflattened = op.reshape(
+            unpermuted, (num_tokens, self.num_experts_per_token, unpermuted.shape[1])
+        )
+        expert_weights = op.reshape(expert_weights, (num_tokens, self.num_experts_per_token, 1))
+        weighted_sum = op.sum(unflattened * expert_weights, axis=1)
+        weighted_sum = op.reshape(
+            weighted_sum, (input_shape[0], input_shape[1], weighted_sum.shape[-1])
+        )
+        return weighted_sum
 
 
 class MistralAttention(nn.Module):  # pylint: disable=too-many-instance-attributes
@@ -321,7 +615,7 @@ class MistralDecoderLayer(nn.Module):
     def __init__(self, config: MistralConfig, rotary_embedding: RotaryEmbedding):
         rms_norm_eps = config.rms_norm_eps
         self.self_attn = MistralAttention(config, rotary_embedding)
-        self.mlp = MistralMLP(config)
+        self.mlp = MistralMLP(config) if config.num_experts == 0 else MistralMoE(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, -1, rms_norm_eps, bias=False)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, -1, rms_norm_eps, bias=False)
 

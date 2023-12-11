@@ -80,6 +80,7 @@ MODELS: Dict[str, Model] = {
             "awq": mistral_loader.awq,
         },
         quantize={
+            "no-quant": mistral_quantization.no_quant,
             "group-quant": mistral_quantization.group_quant,
         },
     ),

@@ -3,7 +3,6 @@ from typing import List, Optional
 
 from tvm import te, tir
 
-
 def convert_uint_to_float(  # pylint: disable=too-many-arguments
     weight: te.Tensor,
     bits: int,
@@ -21,7 +20,7 @@ def convert_uint_to_float(  # pylint: disable=too-many-arguments
         else out_shape,
         fcompute=lambda *idx: tir.bitwise_and(
             tir.shift_right(
-                weight[*idx[:-1], idx[-1] // num_elem_per_storage],
+                weight[idx[:-1]+ (idx[-1] // num_elem_per_storage, )],
                 (
                     ((idx[-1] % num_elem_per_storage) % 2 * 4 + (idx[-1] % num_elem_per_storage) // 2) * bits
                     if ft_reorder

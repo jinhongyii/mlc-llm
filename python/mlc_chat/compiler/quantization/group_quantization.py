@@ -143,10 +143,10 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
             else out_shape,
             fcompute=lambda *idx: tir.multiply(
                 tir.subtract(
-                    float_weight[*idx[:-1], idx[-1]],
+                    float_weight[idx[:-1]+ (idx[-1],)],
                     tir_max_int,
                 ),
-                scale[*idx[:-1], idx[-1] // self.group_size],
+                scale[idx[:-1]+ (idx[-1] // self.group_size,)],
             ),
             name="dequantize",
         )
@@ -231,7 +231,7 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
             fcompute=lambda *idx: te.max(
                 tir.if_then_else(
                     idx[-1] * self.group_size + r < k,
-                    te.abs(weight[*idx[:-1], idx[-1] * self.group_size + r]),
+                    te.abs(weight[idx[:-1]+ (idx[-1] * self.group_size + r,)]),
                     te.min_value(self.model_dtype),
                 ),
                 axis=r,
@@ -240,7 +240,7 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
         )
         scale = te.compute(
             scale_shape,
-            lambda *idx: max_abs[*idx[:-1], idx[-1]].astype(self.model_dtype) / max_int,
+            lambda *idx: max_abs[idx[:-1]+(idx[-1],)].astype(self.model_dtype) / max_int,
             name="scale",
         )
         # compute scaled weight
@@ -249,7 +249,7 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
             fcompute=lambda *idx: tir.min(
                 tir.max(
                     tir.round(
-                        weight[*idx[:-1], idx[-1]] / scale[*idx[:-1], idx[-1] // self.group_size]
+                        weight[idx[:-1]+ (idx[-1],)] / scale[idx[:-1]+ (idx[-1] // self.group_size,)]
                         + max_int
                     ),
                     tir.const(0, self.model_dtype),
@@ -266,7 +266,7 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
             fcompute=lambda *idx: tir.sum(
                 tir.if_then_else(
                     idx[-1] * self.num_elem_per_storage + r < k,
-                    scaled_weight[*idx[:-1], idx[-1] * self.num_elem_per_storage + r]
+                    scaled_weight[idx[:-1]+(idx[-1] * self.num_elem_per_storage + r,)]
                     << (r * quantize_dtype.bits),
                     0,
                 ),

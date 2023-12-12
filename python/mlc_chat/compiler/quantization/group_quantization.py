@@ -9,6 +9,7 @@ from tvm.relax.frontend import nn
 from tvm.runtime import NDArray
 from tvm.target import Target
 
+from ..model.mistral.mistral_model import MistralExperts
 from ...support import logging
 from .. import tensor_parallel as tp
 from ..loader import QuantizeMapping
@@ -109,6 +110,11 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
                     self.quant_map.param_map[weight_name] = [f"{name}.q_weight", f"{name}.q_scale"]
                     self.quant_map.map_func[weight_name] = self.config.quantize_weight
                     return GroupQuantizeEmbedding.from_embedding(node, self.config)
+                if isinstance(node, MistralExperts):
+                    weight_name = f"{name}.weight"
+                    self.quant_map.param_map[weight_name] = [f"{name}.q_weight", f"{name}.q_scale"]
+                    self.quant_map.map_func[weight_name] = self.config.quantize_weight
+                    return GroupQuantizeMistralExperts.from_mixtral_experts(node, self.config)
                 return self.visit(name, node)
 
         model.to(dtype=self.model_dtype)
@@ -132,15 +138,15 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
             out_shape,
         )
         return te.compute(
-            shape=[weight.shape[0], weight.shape[1] * self.num_elem_per_storage]
+            shape=[*weight.shape[:-1], weight.shape[-1] * self.num_elem_per_storage]
             if out_shape is None
             else out_shape,
-            fcompute=lambda i, j: tir.multiply(
+            fcompute=lambda *idx: tir.multiply(
                 tir.subtract(
-                    float_weight[i, j],
+                    float_weight[*idx[:-1], idx[-1]],
                     tir_max_int,
                 ),
-                scale[i, j // self.group_size],
+                scale[*idx[:-1], idx[-1] // self.group_size],
             ),
             name="dequantize",
         )
@@ -159,7 +165,6 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
         ret: List[NDArray]
             The list of group quantized weights.
         """
-        assert len(weight.shape) == 2
         device = weight.device
         device_type = device.MASK2STR[device.device_type]
 
@@ -193,7 +198,14 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
             vm = relax.VirtualMachine(ex, device)  # pylint: disable=invalid-name
             return vm["main"]
 
-        key = str((int(weight.shape[0]), int(weight.shape[1]), weight.dtype, device_type))
+        key = str(
+            (
+                *(int(weight.shape[i]) for i in range(len(weight.shape) - 1)),
+                int(weight.shape[-1]),
+                weight.dtype,
+                device_type,
+            )
+        )
         quantize_func = self._quantize_func_cache.get(key, None)
         if quantize_func is None:
             logger.info("Compiling quantize function for key: %s", key)
@@ -206,20 +218,20 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
         weight: te.Tensor,
     ) -> Tuple[te.Tensor, te.Tensor]:
         """Group quantization for weight tensor, defined in tensor expression."""
-        assert len(weight.shape) == 2
         max_int = tir.const(self.max_int_value, self.model_dtype)
-        n, k = weight.shape  # pylint: disable=invalid-name
+        shape = weight.shape  # pylint: disable=invalid-name
+        k = shape[-1]
         quantize_dtype = DataType(self.quantize_dtype)
         # compute scale per group
         r = te.reduce_axis((0, self.group_size), name="r")  # pylint: disable=invalid-name
         num_group = tir.ceildiv(k, self.group_size)
-        scale_shape = (n, num_group)
+        scale_shape = (*shape[:-1], num_group)
         max_abs = te.compute(
             shape=scale_shape,
-            fcompute=lambda i, j: te.max(
+            fcompute=lambda *idx: te.max(
                 tir.if_then_else(
-                    j * self.group_size + r < k,
-                    te.abs(weight[i, j * self.group_size + r]),
+                    idx[-1] * self.group_size + r < k,
+                    te.abs(weight[*idx[:-1], idx[-1] * self.group_size + r]),
                     te.min_value(self.model_dtype),
                 ),
                 axis=r,
@@ -228,15 +240,18 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
         )
         scale = te.compute(
             scale_shape,
-            lambda i, j: max_abs[i, j].astype(self.model_dtype) / max_int,
+            lambda *idx: max_abs[*idx[:-1], idx[-1]].astype(self.model_dtype) / max_int,
             name="scale",
         )
         # compute scaled weight
         scaled_weight = te.compute(
             shape=weight.shape,
-            fcompute=lambda i, j: tir.min(
+            fcompute=lambda *idx: tir.min(
                 tir.max(
-                    tir.round(weight[i, j] / scale[i, j // self.group_size] + max_int),
+                    tir.round(
+                        weight[*idx[:-1], idx[-1]] / scale[*idx[:-1], idx[-1] // self.group_size]
+                        + max_int
+                    ),
                     tir.const(0, self.model_dtype),
                 ),
                 max_int * 2,
@@ -245,13 +260,13 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
         # compute quantized weight per storage
         r = te.reduce_axis((0, self.num_elem_per_storage), name="r")  # pylint: disable=invalid-name
         num_storage = self.num_storage_per_group * num_group
-        quantized_weight_shape = (n, num_storage)
+        quantized_weight_shape = (*shape[:-1], num_storage)
         quantized_weight = te.compute(
             shape=quantized_weight_shape,
-            fcompute=lambda i, j: tir.sum(
+            fcompute=lambda *idx: tir.sum(
                 tir.if_then_else(
-                    j * self.num_elem_per_storage + r < k,
-                    scaled_weight[i, j * self.num_elem_per_storage + r]
+                    idx[-1] * self.num_elem_per_storage + r < k,
+                    scaled_weight[*idx[:-1], idx[-1] * self.num_elem_per_storage + r]
                     << (r * quantize_dtype.bits),
                     0,
                 ),
@@ -427,6 +442,86 @@ class GroupQuantizeEmbedding(nn.Module):
         return nn.op.reshape(
             nn.op.take(w, nn.op.reshape(x, shape=[-1]), axis=0),
             shape=[*x.shape, self.dim],
+        )
+
+
+class GroupQuantizeMistralExperts(nn.Module):
+    def __init__(self, num_experts, in_features, out_features, config: GroupQuantize):
+        self.num_experts = num_experts
+        self.in_features = in_features
+        self.out_features = out_features
+        self.config = config
+        num_group = tir.ceildiv(in_features, config.group_size)
+        self.q_weight = nn.Parameter(
+            (num_experts, out_features, config.num_storage_per_group * num_group),
+            config.storage_dtype,
+        )
+        self.q_scale = nn.Parameter((num_experts, out_features, num_group), config.model_dtype)
+
+    @staticmethod
+    def from_mixtral_experts(
+        src: "MistralExperts", config: GroupQuantize
+    ) -> "GroupQuantizeMistralExperts":
+        """
+        Converts a non-quantized MistralExperts to a group quantized GroupQuantizeMistralExperts
+
+        Parameters
+        ----------
+        src : MistralExperts
+            The non-quantized MistralExperts
+
+        config : GroupQuantize
+            The group quantization config.
+
+        Returns
+        -------
+        ret : GroupQuantizeMistralExperts
+            The group quantized GroupQuantizeMistralExperts layer.
+        """
+        quantized_mistral_experts = GroupQuantizeMistralExperts(
+            num_experts=src.num_experts,
+            in_features=src.in_features,
+            out_features=src.out_features,
+            config=config,
+        )
+        return quantized_mistral_experts
+
+    def forward(self, x: nn.Tensor, indptr: nn.Tensor) -> nn.Tensor:  # pylint: disable=invalid-name
+        """
+        Forward method for group quantized mistral experts.
+
+        Parameters
+        ----------
+        x : nn.Tensor
+            The input tensor.
+
+        indptr: nn.Tensor
+            The indptr tensor
+
+        Returns
+        -------
+        ret : nn.Tensor
+            The output tensor for the group quantized mistral experts layer.
+        """
+        w = nn.op.tensor_expr_op(  # pylint: disable=invalid-name
+            lambda weight, scale: self.config._dequantize(  # pylint: disable=protected-access
+                weight,
+                scale,
+            ),
+            name_hint="dequantize",
+            args=[self.q_weight, self.q_scale],
+        )
+        bb = relax.BlockBuilder.current()
+
+        return nn.op._wrap_nested(
+            bb.emit(
+                relax.call_dps_packed(
+                    "torch.groupgemm",
+                    [x._expr, w._expr, indptr._expr],
+                    out_sinfo=relax.TensorStructInfo((x.shape[0], self.out_features), w.dtype),
+                )
+            ),
+            name="groupgemm",
         )
 
 

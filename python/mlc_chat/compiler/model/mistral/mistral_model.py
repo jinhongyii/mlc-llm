@@ -9,7 +9,8 @@ from tvm import relax as rx
 from tvm import te, tir
 from tvm.relax.frontend import nn
 from tvm.relax.frontend.nn import Tensor, op
-
+from tvm.topi.cuda.scan import exclusive_scan, inclusive_scan
+from tvm.topi.cuda.sort import topk
 from ....support import logging
 from ....support.config import ConfigBase
 from ....support.style import bold
@@ -184,6 +185,12 @@ class MistralMoE(nn.Module):
             out_features=config.hidden_size,
         )
         self.dtype = "float32"
+
+    def topk(self, data: Tensor, k: int) -> Tensor:
+        return op.tensor_expr_op(topk, "topk", args=[data, k, -1, "both", False, "int32"])
+
+    def cumsum(self, data: Tensor, dim: int) -> Tensor:
+        return op.tensor_expr_op(inclusive_scan, "cumsum", args=[data, dim, "int32"])
 
     def topk_mask(self, topk_indices: Tensor) -> Tensor:
         from functools import reduce
@@ -378,34 +385,13 @@ class MistralMoE(nn.Module):
 
         # MoE data preparation
         gate: Tensor = self.gate(x)
-        expert_weights, expert_indices = op._wrap_nested(
-            bb.emit(
-                relax.op.call_dps_packed(
-                    "torch.topk",
-                    [gate._expr, self.num_experts_per_token],
-                    out_sinfo=[
-                        relax.TensorStructInfo([num_tokens, self.num_experts_per_token], x.dtype),
-                        relax.TensorStructInfo([num_tokens, self.num_experts_per_token], "int32"),
-                    ],
-                )
-            ),
-            name="topk",
-        )
+        expert_weights, expert_indices = self.topk(gate, self.num_experts_per_token)
         expert_weights = op.softmax(expert_weights, axis=-1)
         expert_mask = self.topk_mask(expert_indices)
         mask_T_flattened = op.reshape(
             op.permute_dims(expert_mask), (expert_mask.shape[0] * expert_mask.shape[1],)
         )
-        cumsum_colwise_flattened = op._wrap_nested(
-            bb.emit(
-                relax.op.call_dps_packed(
-                    "torch.cumsum",
-                    [mask_T_flattened._expr, 0],
-                    out_sinfo=relax.TensorStructInfo([num_tokens * self.num_experts], "int32"),
-                )
-            ),
-            name="cumsum",
-        )
+        cumsum_colwise_flattened = self.cumsum(mask_T_flattened, dim=0)
         flattened_indices = self.get_indices(cumsum_colwise_flattened, expert_indices)
         indptr = self.get_indptr(cumsum_colwise_flattened)
         token_indices = op.divide(flattened_indices, Tensor.from_const(self.num_experts_per_token))

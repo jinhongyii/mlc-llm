@@ -446,8 +446,9 @@ class GroupQuantizeEmbedding(nn.Module):
 
 
 class GroupQuantizeMistralExperts(nn.Module):
-    def __init__(self, num_experts, in_features, out_features, config: GroupQuantize):
+    def __init__(self, num_experts, num_experts_per_token, in_features, out_features, config: GroupQuantize):
         self.num_experts = num_experts
+        self.num_experts_per_token = num_experts_per_token
         self.in_features = in_features
         self.out_features = out_features
         self.config = config
@@ -457,7 +458,117 @@ class GroupQuantizeMistralExperts(nn.Module):
             config.storage_dtype,
         )
         self.q_scale = nn.Parameter((num_experts, out_features, num_group), config.model_dtype)
+        self.dtype = config.model_dtype
+        
+    def gemv_e1_e3(self, x: nn.Tensor, w: nn.Tensor, scale: nn.Tensor, indptr: nn.Tensor, ):
+        bits = DataType(self.config.quantize_dtype).bits
+        tir_max_int = tir.const(self.config.max_int_value, self.config.model_dtype)
+        from tvm import relax
 
+        from tvm.script import tir as T
+        @T.prim_func
+        def dequantize_gemv_e1_e3(var_x: T.handle, var_w: T.handle, var_scale:T.handle, var_indptr: T.handle, var_o: T.handle):
+            T.func_attr({"op_pattern": 4})
+            x = T.match_buffer(var_x, (1, self.in_features), self.dtype)
+            w = T.match_buffer(var_w, (self.num_experts, self.out_features, self.in_features //self.config.num_elem_per_storage), self.config.storage_dtype)
+            scale = T.match_buffer(var_scale, (self.num_experts, self.out_features, self.in_features//self.config.group_size), self.dtype)
+            indptr = T.match_buffer(var_indptr, (self.num_experts_per_token,), "int32")
+            o = T.match_buffer(var_o, (self.num_experts_per_token, self.out_features), self.dtype)
+            # with T.block("root"):
+            for expert_id in T.thread_binding(self.num_experts_per_token, thread="blockIdx.y"):
+                with T.block("gemv_o"):
+                    v_expert_id_o = T.axis.spatial(self.num_experts_per_token, expert_id)
+                    vi_o = T.axis.spatial(1, 0)
+                    vj_o = T.axis.reduce(1, 0)
+                    compute = T.alloc_buffer((self.out_features, self.in_features), self.dtype)
+                    dequantize = T.alloc_buffer((self.out_features, self.in_features), self.dtype)
+                    for i1, i2 in T.grid(self.out_features, self.in_features):
+                        with T.block("compute"):
+                            v_i1, v_i2 = T.axis.remap("SS", [i1, i2])
+                            compute[v_i1, v_i2] = T.Cast(self.dtype, T.bitwise_and(T.shift_right(w[indptr[v_expert_id_o], v_i1, v_i2 // self.config.num_elem_per_storage],
+                                                                                                 T.Cast(self.config.storage_dtype, v_i2 % self.config.num_elem_per_storage * bits)),
+                                                                                   tir.const((1 << bits) - 1, self.config.storage_dtype)))
+                    for i1, i2 in T.grid(self.out_features, self.in_features):
+                        with T.block("dequantize"):
+                            v_i1, v_i2 = T.axis.remap("SS", [i1, i2])
+                            dequantize[v_i1, v_i2] = (compute[v_i1, v_i2] - tir_max_int) * scale[indptr[v_expert_id_o], v_i1, v_i2 // self.config.group_size]
+                    for i, j in T.grid(self.out_features, self.in_features):
+                        with T.block("gemv"):
+                            vi_i, vj_i = T.axis.remap("SR", [i, j])
+                            T.reads(x[0, vj_i], dequantize[vi_i, vj_i], indptr[v_expert_id_o])
+                            T.writes(o[v_expert_id_o, vi_i])
+                            with T.init():
+                                o[v_expert_id_o, vi_i] = T.cast(T.float16(0), self.dtype)
+                            o[v_expert_id_o, vi_i] = o[v_expert_id_o, vi_i] + x[0, vj_i] * dequantize[vi_i, vj_i]
+                            
+        bb = relax.BlockBuilder.current()
+        gvar = bb.add_func(dequantize_gemv_e1_e3, "dequantize_gemv_e1_e3")
+        return nn.op._wrap_nested(
+            bb.emit(
+                relax.call_tir(
+                    gvar,
+                    [x._expr, w._expr, scale._expr, indptr._expr],
+                    out_sinfo=relax.TensorStructInfo(
+                        [indptr.shape[0], self.out_features], self.dtype
+                    ),
+                )
+            ),
+            name="dequantize_gemv_e1_e3",
+        )
+
+    def gemv_e2(self, x: nn.Tensor, w: nn.Tensor, scale: nn.Tensor, indptr: nn.Tensor,):
+        from tvm import relax
+        bits = DataType(self.config.quantize_dtype).bits
+        tir_max_int = tir.const(self.config.max_int_value, self.config.model_dtype)
+        from tvm.script import tir as T
+        @T.prim_func
+        def dequantize_gemv_e2(var_x: T.handle, var_w: T.handle, var_scale:T.handle, var_indptr: T.handle, var_o: T.handle):
+            T.func_attr({"op_pattern": 4})
+            x = T.match_buffer(var_x, (self.num_experts_per_token, self.in_features), self.dtype)
+            w = T.match_buffer(var_w, (self.num_experts, self.out_features, self.in_features //self.config.num_elem_per_storage), self.config.storage_dtype)
+            scale = T.match_buffer(var_scale, (self.num_experts, self.out_features, self.in_features//self.config.group_size), self.dtype)
+            indptr = T.match_buffer(var_indptr, (self.num_experts_per_token, ), "int32")
+            o = T.match_buffer(var_o, (self.num_experts_per_token, self.out_features), self.dtype)
+            # with T.block("root"):
+            for expert_id in T.thread_binding(self.num_experts_per_token, thread="blockIdx.y"):
+                with T.block("gemv_o"):
+                    v_expert_id_o = T.axis.spatial(self.num_experts_per_token, expert_id)
+                    vi_o = T.axis.spatial(1, 0)
+                    vj_o = T.axis.reduce(1, 0)
+                    compute = T.alloc_buffer((self.out_features, self.in_features), self.dtype)
+                    dequantize = T.alloc_buffer((self.out_features, self.in_features), self.dtype)
+                    for i1, i2 in T.grid(self.out_features, self.in_features):
+                        with T.block("compute"):
+                            v_i1, v_i2 = T.axis.remap("SS", [i1, i2])
+                            compute[v_i1, v_i2] = T.Cast(self.dtype, T.bitwise_and(T.shift_right(w[indptr[v_expert_id_o], v_i1, v_i2 // self.config.num_elem_per_storage],
+                                                                                                 T.Cast(self.config.storage_dtype, v_i2 % self.config.num_elem_per_storage * bits)),
+                                                                                   tir.const((1 << bits) - 1, self.config.storage_dtype)))
+                    for i1, i2 in T.grid(self.out_features, self.in_features):
+                        with T.block("dequantize"):
+                            v_i1, v_i2 = T.axis.remap("SS", [i1, i2])
+                            dequantize[v_i1, v_i2] = (compute[v_i1, v_i2] - tir_max_int) * scale[indptr[v_expert_id_o], v_i1, v_i2 // self.config.group_size]
+                    for i, j in T.grid(self.out_features, self.in_features):
+                        with T.block("gemv"):
+                            vi_i, vj_i = T.axis.remap("SR", [i, j])
+                            with T.init():
+                                o[v_expert_id_o, vi_i] = T.cast(T.float16(0), self.dtype)
+                            o[v_expert_id_o, vi_i] = o[v_expert_id_o, vi_i] + x[v_expert_id_o, vj_i] * dequantize[vi_i, vj_i]
+                            
+        bb = relax.BlockBuilder.current()
+        gvar = bb.add_func(dequantize_gemv_e2, "dequantize_gemv_e2")
+        return nn.op._wrap_nested(
+            bb.emit(
+                relax.call_tir(
+                    gvar,
+                    [x._expr, w._expr, scale._expr, indptr._expr],
+                    out_sinfo=relax.TensorStructInfo(
+                        [indptr.shape[0], self.out_features], self.dtype
+                    ),
+                )
+            ),
+            name="dequantize_gemv_e2",
+        )
+        
     @staticmethod
     def from_mixtral_experts(
         src: "MistralExperts", config: GroupQuantize
@@ -480,13 +591,14 @@ class GroupQuantizeMistralExperts(nn.Module):
         """
         quantized_mistral_experts = GroupQuantizeMistralExperts(
             num_experts=src.num_experts,
+            num_experts_per_token=src.num_experts_per_token,
             in_features=src.in_features,
             out_features=src.out_features,
             config=config,
         )
         return quantized_mistral_experts
 
-    def forward(self, x: nn.Tensor, indptr: nn.Tensor) -> nn.Tensor:  # pylint: disable=invalid-name
+    def forward(self, x: nn.Tensor, indptr: nn.Tensor, single_batch_decode: bool = False) -> nn.Tensor:  # pylint: disable=invalid-name
         """
         Forward method for group quantized mistral experts.
 
@@ -503,6 +615,20 @@ class GroupQuantizeMistralExperts(nn.Module):
         ret : nn.Tensor
             The output tensor for the group quantized mistral experts layer.
         """
+
+            
+
+        assert x.ndim == 2
+        if single_batch_decode:
+            #single-batch decode
+            assert x.shape[1] == self.in_features
+            assert indptr.ndim == 1
+            if x.shape[0] == 1:
+                return self.gemv_e1_e3(x, self.q_weight, self.q_scale, indptr)
+            else:
+                return self.gemv_e2(x, self.q_weight, self.q_scale, indptr)
+            
+        bb = relax.BlockBuilder.current()
         w = nn.op.tensor_expr_op(  # pylint: disable=invalid-name
             lambda weight, scale: self.config._dequantize(  # pylint: disable=protected-access
                 weight,
@@ -511,8 +637,6 @@ class GroupQuantizeMistralExperts(nn.Module):
             name_hint="dequantize",
             args=[self.q_weight, self.q_scale],
         )
-        bb = relax.BlockBuilder.current()
-
         return nn.op._wrap_nested(
             bb.emit(
                 relax.call_dps_packed(

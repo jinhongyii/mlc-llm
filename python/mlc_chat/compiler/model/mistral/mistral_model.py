@@ -140,8 +140,9 @@ class MistralMLP(nn.Module):
 
 
 class MistralExperts(nn.Module):
-    def __init__(self, num_experts, in_features, out_features):
+    def __init__(self, num_experts, num_experts_per_token, in_features, out_features):
         self.num_experts = num_experts
+        self.num_experts_per_token = num_experts_per_token  
         self.in_features = in_features
         self.out_features = out_features
         self.weight = nn.Parameter((num_experts, out_features, in_features))
@@ -153,15 +154,15 @@ class MistralExperts(nn.Module):
         from tvm.script import tir as T
         @T.prim_func
         def _gemv_e1_e3(var_x: T.handle, var_w: T.handle, var_indptr: T.handle, var_o: T.handle):
-            num_experts_per_token = T.int64()
+            T.func_attr({"op_pattern": 4})
             x = T.match_buffer(var_x, (1, self.in_features), self.dtype)
             w = T.match_buffer(var_w, (self.num_experts, self.out_features, self.in_features), self.dtype)
-            indptr = T.match_buffer(var_indptr, (num_experts_per_token,), "int32")
-            o = T.match_buffer(var_o, (num_experts_per_token, self.out_features), self.dtype)
+            indptr = T.match_buffer(var_indptr, (self.num_experts_per_token,), "int32")
+            o = T.match_buffer(var_o, (self.num_experts_per_token, self.out_features), self.dtype)
             # with T.block("root"):
-            for expert_id in T.thread_binding(num_experts_per_token, thread="blockIdx.y"):
+            for expert_id in T.thread_binding(self.num_experts_per_token, thread="blockIdx.y"):
                 with T.block("gemv_o"):
-                    v_expert_id_o = T.axis.spatial(num_experts_per_token, expert_id)
+                    v_expert_id_o = T.axis.spatial(self.num_experts_per_token, expert_id)
                     vi_o = T.axis.spatial(1, 0)
                     vj_o = T.axis.reduce(1, 0)
                     T.reads(x[0, 0:self.in_features], w[indptr[v_expert_id_o], 0:self.out_features, 0:self.in_features], indptr[v_expert_id_o])
@@ -196,15 +197,15 @@ class MistralExperts(nn.Module):
         from tvm.script import tir as T
         @T.prim_func
         def _gemv_e2(var_x: T.handle, var_w: T.handle, var_indptr: T.handle, var_o: T.handle):
-            num_experts_per_token = T.int64()
-            x = T.match_buffer(var_x, (num_experts_per_token, self.in_features), self.dtype)
+            T.func_attr({"op_pattern": 4})
+            x = T.match_buffer(var_x, (self.num_experts_per_token, self.in_features), self.dtype)
             w = T.match_buffer(var_w, (self.num_experts, self.out_features, self.in_features), self.dtype)
-            indptr = T.match_buffer(var_indptr, (num_experts_per_token,), "int32")
-            o = T.match_buffer(var_o, (num_experts_per_token, self.out_features), self.dtype)
+            indptr = T.match_buffer(var_indptr, (self.num_experts_per_token,), "int32")
+            o = T.match_buffer(var_o, (self.num_experts_per_token, self.out_features), self.dtype)
             # with T.block("root"):
-            for expert_id in T.thread_binding(num_experts_per_token, thread="blockIdx.y"):
+            for expert_id in T.thread_binding(self.num_experts_per_token, thread="blockIdx.y"):
                 with T.block("gemv_o"):
-                    v_expert_id_o = T.axis.spatial(num_experts_per_token, expert_id)
+                    v_expert_id_o = T.axis.spatial(self.num_experts_per_token, expert_id)
                     vi_o = T.axis.spatial(1, 0)
                     vj_o = T.axis.reduce(1, 0)
                     T.reads(x[v_expert_id_o, 0:self.in_features], w[indptr[v_expert_id_o], 0:self.out_features, 0:self.in_features], indptr[v_expert_id_o])
@@ -272,11 +273,13 @@ class MistralMoE(nn.Module):
         self.num_experts = config.num_experts
         self.e1_e3 = MistralExperts(
             self.num_experts,
+            self.num_experts_per_token,
             in_features=config.hidden_size,
             out_features=2 * config.intermediate_size,
         )
         self.e2 = MistralExperts(
             self.num_experts,
+            self.num_experts_per_token,
             in_features=config.intermediate_size,
             out_features=config.hidden_size,
         )

@@ -145,11 +145,107 @@ class MistralExperts(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.weight = nn.Parameter((num_experts, out_features, in_features))
+        self.dtype = "float32"
 
-    def forward(self, x: Tensor, indptr: Tensor):
+    def gemv_e1_e3(self, x: Tensor, indptr: Tensor, ):
+        from tvm import relax
+
+        from tvm.script import tir as T
+        @T.prim_func
+        def _gemv_e1_e3(var_x: T.handle, var_w: T.handle, var_indptr: T.handle, var_o: T.handle):
+            num_experts_per_token = T.int64()
+            x = T.match_buffer(var_x, (1, self.in_features), self.dtype)
+            w = T.match_buffer(var_w, (self.num_experts, self.out_features, self.in_features), self.dtype)
+            indptr = T.match_buffer(var_indptr, (num_experts_per_token,), "int32")
+            o = T.match_buffer(var_o, (num_experts_per_token, self.out_features), self.dtype)
+            # with T.block("root"):
+            for expert_id in T.thread_binding(num_experts_per_token, thread="blockIdx.y"):
+                with T.block("gemv_o"):
+                    v_expert_id_o = T.axis.spatial(num_experts_per_token, expert_id)
+                    vi_o = T.axis.spatial(1, 0)
+                    vj_o = T.axis.reduce(1, 0)
+                    T.reads(x[0, 0:self.in_features], w[indptr[v_expert_id_o], 0:self.out_features, 0:self.in_features], indptr[v_expert_id_o])
+                    T.writes(o[v_expert_id_o, 0:self.out_features])
+                    for i, j in T.grid(self.out_features, self.in_features):
+                        with T.block("gemv"):
+                            vi_i, vj_i = T.axis.remap("SR", [i, j])
+                            T.reads(x[0, vj_i], w[indptr[v_expert_id_o], vi_i, vj_i], indptr[v_expert_id_o])
+                            T.writes(o[v_expert_id_o, vi_i])
+                            with T.init():
+                                o[v_expert_id_o, vi_i] = T.cast(T.float16(0), self.dtype)
+                            o[v_expert_id_o, vi_i] = o[v_expert_id_o, vi_i] + x[0, vj_i] * w[indptr[v_expert_id_o], vi_i, vj_i]
+                            
+        bb = relax.BlockBuilder.current()
+        gvar = bb.add_func(_gemv_e1_e3, "gemv_e1_e3")
+        return op._wrap_nested(
+            bb.emit(
+                relax.call_tir(
+                    gvar,
+                    [x._expr, self.weight._expr, indptr._expr],
+                    out_sinfo=relax.TensorStructInfo(
+                        [indptr.shape[0], self.out_features], self.dtype
+                    ),
+                )
+            ),
+            name="gemv_e1_e3",
+        )
+
+    def gemv_e2(self, x: Tensor, indptr: Tensor):
+        from tvm import relax
+
+        from tvm.script import tir as T
+        @T.prim_func
+        def _gemv_e2(var_x: T.handle, var_w: T.handle, var_indptr: T.handle, var_o: T.handle):
+            num_experts_per_token = T.int64()
+            x = T.match_buffer(var_x, (num_experts_per_token, self.in_features), self.dtype)
+            w = T.match_buffer(var_w, (self.num_experts, self.out_features, self.in_features), self.dtype)
+            indptr = T.match_buffer(var_indptr, (num_experts_per_token,), "int32")
+            o = T.match_buffer(var_o, (num_experts_per_token, self.out_features), self.dtype)
+            # with T.block("root"):
+            for expert_id in T.thread_binding(num_experts_per_token, thread="blockIdx.y"):
+                with T.block("gemv_o"):
+                    v_expert_id_o = T.axis.spatial(num_experts_per_token, expert_id)
+                    vi_o = T.axis.spatial(1, 0)
+                    vj_o = T.axis.reduce(1, 0)
+                    T.reads(x[v_expert_id_o, 0:self.in_features], w[indptr[v_expert_id_o], 0:self.out_features, 0:self.in_features], indptr[v_expert_id_o])
+                    T.writes(o[v_expert_id_o, 0:self.out_features])
+                    for i, j in T.grid(self.out_features, self.in_features):
+                        with T.block("gemv"):
+                            vi_i, vj_i = T.axis.remap("SR", [i, j])
+                            T.reads(x[v_expert_id_o, vj_i], w[indptr[v_expert_id_o], vi_i, vj_i], indptr[v_expert_id_o])
+                            T.writes(o[v_expert_id_o, vi_i])
+                            with T.init():
+                                o[v_expert_id_o, vi_i] = T.cast(T.float16(0), self.dtype)
+                            o[v_expert_id_o, vi_i] = o[v_expert_id_o, vi_i] + x[v_expert_id_o, vj_i] * w[indptr[v_expert_id_o], vi_i, vj_i]
+                            
+        bb = relax.BlockBuilder.current()
+        gvar = bb.add_func(_gemv_e2, "gemv_e2")
+        return op._wrap_nested(
+            bb.emit(
+                relax.call_tir(
+                    gvar,
+                    [x._expr, self.weight._expr, indptr._expr],
+                    out_sinfo=relax.TensorStructInfo(
+                        [indptr.shape[0], self.out_features], self.dtype
+                    ),
+                )
+            ),
+            name="gemv_e2",
+        )
+        
+    def forward(self, x: Tensor, indptr: Tensor, single_batch_decode: bool = False):
         from tvm import relax
 
         assert x.ndim == 2
+        if single_batch_decode:
+            #single-batch decode
+            assert x.shape[1] == self.in_features
+            assert indptr.ndim == 1
+            if x.shape[0] == 1:
+                return self.gemv_e1_e3(x, indptr)
+            else:
+                return self.gemv_e2(x, indptr)
+        
         bb = relax.BlockBuilder.current()
 
         return op._wrap_nested(
@@ -336,8 +432,8 @@ class MistralMoE(nn.Module):
             var_flattened_expert_indices: T.handle,
             var_scattered_output: T.handle,
         ):
-            out_features = T.int32()
-            flattened_indices_length = T.int32()
+            out_features = T.int64()
+            flattened_indices_length = T.int64()
 
             unscattered_output = T.match_buffer(
                 var_unscattered_output,
@@ -387,27 +483,35 @@ class MistralMoE(nn.Module):
         gate: Tensor = self.gate(x)
         expert_weights, expert_indices = self.topk(gate, self.num_experts_per_token)
         expert_weights = op.softmax(expert_weights, axis=-1)
-        expert_mask = self.topk_mask(expert_indices)
-        mask_T_flattened = op.reshape(
-            op.permute_dims(expert_mask), (expert_mask.shape[0] * expert_mask.shape[1],)
-        )
-        cumsum_colwise_flattened = self.cumsum(mask_T_flattened, dim=0)
-        flattened_indices = self.get_indices(cumsum_colwise_flattened, expert_indices)
-        indptr = self.get_indptr(cumsum_colwise_flattened)
-        token_indices = op.divide(flattened_indices, Tensor.from_const(self.num_experts_per_token))
-        gathered_x = op.take(x, token_indices, axis=0)
+        if num_tokens == 1:
+            #single batch decode
+            expert_indices = op.reshape(expert_indices, (self.num_experts_per_token,))
+            concat_x1_x3 = self.e1_e3(x, expert_indices, single_batch_decode=True)
+            x1, x3 = op.split(concat_x1_x3, indices_or_sections=2, axis=-1)
+            linear_out = self.e2(op.silu(x1) * x3, expert_indices, single_batch_decode=True)
+            unflattened = op.reshape(linear_out, (num_tokens, self.num_experts_per_token, linear_out.shape[-1]))
+        else:
+            expert_mask = self.topk_mask(expert_indices)
+            mask_T_flattened = op.reshape(
+                op.permute_dims(expert_mask), (expert_mask.shape[0] * expert_mask.shape[1],)
+            )
+            cumsum_colwise_flattened = self.cumsum(mask_T_flattened, dim=0)
+            flattened_indices = self.get_indices(cumsum_colwise_flattened, expert_indices)
+            indptr = self.get_indptr(cumsum_colwise_flattened)
+            token_indices = op.divide(flattened_indices, Tensor.from_const(self.num_experts_per_token))
+            gathered_x = op.take(x, token_indices, axis=0)
 
-        # MLP forward begin
-        concat_x1_x3 = self.e1_e3(gathered_x, indptr)
-        x1, x3 = op.split(concat_x1_x3, indices_or_sections=2, axis=-1)
-        linear_out = self.e2(op.silu(x1) * x3, indptr)
-        # MLP forward end
+            # MLP forward begin
+            concat_x1_x3 = self.e1_e3(gathered_x, indptr)
+            x1, x3 = op.split(concat_x1_x3, indices_or_sections=2, axis=-1)
+            linear_out = self.e2(op.silu(x1) * x3, indptr)
+            # MLP forward end
 
-        # MoE result post-processing
-        unpermuted = self.scatter_output(flattened_indices, linear_out)
-        unflattened = op.reshape(
-            unpermuted, (num_tokens, self.num_experts_per_token, unpermuted.shape[1])
-        )
+            # MoE result post-processing
+            unpermuted = self.scatter_output(flattened_indices, linear_out)
+            unflattened = op.reshape(
+                unpermuted, (num_tokens, self.num_experts_per_token, unpermuted.shape[1])
+            )
         expert_weights = op.reshape(expert_weights, (num_tokens, self.num_experts_per_token, 1))
         weighted_sum = op.sum(unflattened * expert_weights, axis=1)
         weighted_sum = op.reshape(

@@ -24,7 +24,11 @@ class FuseDequantizeMatmulEwise:  # pylint: disable=too-few-public-methods
                         [
                             (
                                 "dequantize_matmul",
-                                *_pattern(match_ewise, n_aux_tensor),
+                                *_pattern(match_ewise, n_aux_tensor, True),
+                            ),
+                            (
+                                "dequantize_matmul2",
+                                *_pattern(match_ewise, n_aux_tensor, False),
                             )
                         ]
                     )
@@ -33,7 +37,7 @@ class FuseDequantizeMatmulEwise:  # pylint: disable=too-few-public-methods
         return tvm.transform.Sequential(seq)(mod)
 
 
-def _pattern(match_ewise: int, n_aux_tensor: int):
+def _pattern(match_ewise: int, n_aux_tensor: int, reverse_order):
     # pylint: disable=invalid-name
     w_scaled = wildcard()
     x = wildcard()
@@ -42,9 +46,10 @@ def _pattern(match_ewise: int, n_aux_tensor: int):
         TuplePattern([w_scaled] + [wildcard() for _ in range(n_aux_tensor)]),
         add_constraint=False,
     )
+    prefix_param = [x, w] if not reverse_order else [w, x]
     matmul = is_op("relax.call_tir")(
         GlobalVarPattern(),
-        TuplePattern([x, w] + [wildcard() for _ in range(match_ewise)]),
+        TuplePattern(prefix_param + [wildcard() for _ in range(match_ewise)]),
         add_constraint=False,
     )
     # pylint: enable=invalid-name
@@ -73,12 +78,8 @@ def _pattern(match_ewise: int, n_aux_tensor: int):
         g_var = call.args[0]
         if not isinstance(g_var, relax.GlobalVar):
             return False
-        return (
-            g_var.name_hint.startswith("matmul")
-            or g_var.name_hint.startswith("fused_matmul")
-            or g_var.name_hint.startswith("NT_matmul")
-            or g_var.name_hint.startswith("fused_NT_matmul")
-        )
+        return "matmul" in g_var.name_hint
+
 
     def _check(ctx: relax.transform.PatternCheckContext) -> bool:
         return _check_decoding(ctx) and _check_matmul(ctx)

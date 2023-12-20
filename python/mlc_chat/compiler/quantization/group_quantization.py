@@ -2,12 +2,14 @@
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple
 
+import tvm
 from tvm import DataType, DataTypeCode, IRModule
 from tvm import dlight as dl
 from tvm import relax, te, tir
 from tvm.relax.frontend import nn
 from tvm.runtime import NDArray
 from tvm.target import Target
+from tvm.script import tir as T
 
 from ..model.mistral.mistral_model import MistralExperts
 from ...support import logging
@@ -459,13 +461,13 @@ class GroupQuantizeMistralExperts(nn.Module):
         )
         self.q_scale = nn.Parameter((num_experts, out_features, num_group), config.model_dtype)
         self.dtype = config.model_dtype
+        self.cnt = 0
+
         
     def gemv_e1_e3(self, x: nn.Tensor, w: nn.Tensor, scale: nn.Tensor, indptr: nn.Tensor, ):
         bits = DataType(self.config.quantize_dtype).bits
         tir_max_int = tir.const(self.config.max_int_value, self.config.model_dtype)
-        from tvm import relax
 
-        from tvm.script import tir as T
         @T.prim_func
         def dequantize_gemv_e1_e3(var_x: T.handle, var_w: T.handle, var_scale:T.handle, var_indptr: T.handle, var_o: T.handle):
             T.func_attr({"op_pattern": 4})
@@ -517,10 +519,8 @@ class GroupQuantizeMistralExperts(nn.Module):
         )
 
     def gemv_e2(self, x: nn.Tensor, w: nn.Tensor, scale: nn.Tensor, indptr: nn.Tensor,):
-        from tvm import relax
         bits = DataType(self.config.quantize_dtype).bits
         tir_max_int = tir.const(self.config.max_int_value, self.config.model_dtype)
-        from tvm.script import tir as T
         @T.prim_func
         def dequantize_gemv_e2(var_x: T.handle, var_w: T.handle, var_scale:T.handle, var_indptr: T.handle, var_o: T.handle):
             T.func_attr({"op_pattern": 4})
@@ -567,6 +567,182 @@ class GroupQuantizeMistralExperts(nn.Module):
                 )
             ),
             name="dequantize_gemv_e2",
+        )
+        
+    def group_gemm(self, input: nn.Tensor, weight: nn.Tensor, scale: nn.Tensor, indptr: nn.Tensor):
+        Ne = self.num_experts
+        N = self.out_features
+        K = self.in_features
+        bits = DataType(self.config.quantize_dtype).bits
+        tir_max_int = tir.const(self.config.max_int_value, self.config.model_dtype)
+        BLK_M = 8
+        BLK_N = 128
+        BLK_K = 32
+
+        TX = 8
+        TY = 32
+        CTA_COUNT = 1024
+
+        VEC_X = 1
+        VEC_W = 1
+        VEC_O = 1
+        VEC_DOT = 1
+
+        UNROLL = 64
+        STORAGE_ALIGN = False
+
+        assert BLK_K % 8 == 0
+
+        # fmt: off
+        @T.prim_func(private=True)
+        def dequantize_group_gemm(
+            var_X: T.handle,
+            weight_0: T.Buffer((Ne, N, K // self.config.num_elem_per_storage), dtype=self.config.storage_dtype),
+            weight_1: T.Buffer((Ne, N, K // self.config.group_size), dtype=self.dtype),
+            indptr: T.Buffer((Ne + 1), dtype="int32"),
+            var_O: T.handle,
+        ):
+            T.func_attr({"tir.is_scheduled": 1})
+            B = T.int32(is_size_var=True)
+            X = T.match_buffer(var_X, (B, K), self.dtype)
+            O = T.match_buffer(var_O, (B, N), self.dtype)
+
+            for i in T.thread_binding(CTA_COUNT, thread="blockIdx.x"):
+                with T.block("CTA"):
+                    bx = T.axis.spatial(CTA_COUNT, i)
+
+                    sum = T.alloc_buffer((2,), "int32", scope="local")
+                    row = T.alloc_buffer((2,), "int32", scope="local")
+                    cur_e = T.alloc_buffer((1,), "int32", scope="local")
+                    cur_tile_cnt = T.alloc_buffer((1,), "int32", scope="local")
+
+                    tile_per_row = T.ceildiv(N, BLK_N)
+                    sum[0] = 0
+                    sum[1] = T.ceildiv(indptr[1] - indptr[0], BLK_M) * tile_per_row
+                    row[0] = 0
+                    row[1] = indptr[1] - indptr[0]
+                    cur_e[0] = 0
+                    cur_tile_cnt[0] = bx
+                    row[0] = 0
+            
+                    while cur_e[0] < Ne:
+                        # move to the current group
+                        while cur_tile_cnt[0] >= sum[1] and cur_e[0] < Ne:
+                            cur_e[0] += 1
+                            if cur_e[0] < Ne:
+                                a: T.int32 = cur_e[0]
+                                delta: T.int32 = indptr[a + 1] - indptr[a]
+                                sum[0] = sum[1]
+                                sum[1] += T.ceildiv(delta, BLK_M) * tile_per_row
+                                row[0] = row[1]
+                                row[1] += delta
+                        
+                        # sync threads to make sure all threads have the same tile position
+                        T.evaluate(T.Call(None, "tir.tvm_storage_sync", tvm.runtime.convert(["shared"])))
+                        
+                        if (cur_e[0] < Ne):
+                            # fetch current tile position
+                            a: T.int32 = cur_e[0]
+                            delta: T.int32 = indptr[a + 1] - indptr[a]
+                            tile_cnt_in_group: T.int32 = cur_tile_cnt[0] - sum[0]
+                            tile_m: T.int32 = T.floordiv(tile_cnt_in_group, tile_per_row)
+                            tile_n: T.int32 = T.floormod(tile_cnt_in_group, tile_per_row)
+                            
+                            tile_m_start: T.int32 = row[0] + tile_m * BLK_M
+                            tile_n_start: T.int32 = tile_n * BLK_N
+
+                            with T.block("gemm"):
+                                X_tile = T.alloc_buffer((BLK_M, K), self.dtype, scope="shared")
+                                W_tile = T.alloc_buffer((BLK_N, K), self.dtype, scope="shared")
+                                O_tile = T.alloc_buffer((BLK_M, BLK_N), "float32", scope="local")
+                                
+                                for a0, a1 in T.grid(BLK_M, K): 
+                                    with T.block("X_shared"):
+                                        i, j = T.axis.remap("SS", [a0, a1])
+                                        X_tile[i, j] = T.if_then_else(tile_m_start + i < row[1], X[tile_m_start + i, j], tir.const(0, self.dtype))
+                                for a0, a1 in T.grid(BLK_N, K):
+                                    with T.block("W_shared"):
+                                        i, j = T.axis.remap("SS", [a0, a1])
+                                        n: T.int32 = tile_n_start + i
+                                        W_tile[i, j] = T.if_then_else(
+                                            n < N, 
+                                            (T.Cast(self.dtype, T.bitwise_and(T.shift_right(weight_0[a, n, j // self.config.num_elem_per_storage], T.Cast(self.config.storage_dtype, j % self.config.num_elem_per_storage * bits)), tir.const((1 << bits) - 1, self.config.storage_dtype))) - tir_max_int) * weight_1[a, n, j // self.config.group_size], 
+                                            tir.const(0, self.dtype)
+                                        )
+                                for a0, a1, a2 in T.grid(BLK_M, BLK_N, K):
+                                    with T.block("compute"):
+                                        i, j, k = T.axis.remap("SSR", [a0, a1, a2])
+                                        with T.init():
+                                            O_tile[i, j] = tir.const(0, "float32")
+                                        O_tile[i, j] += T.cast(X_tile[i, k], "float32") *  T.cast(W_tile[j, k], "float32")
+                                for a0, a1 in T.grid(BLK_M, BLK_N):
+                                    with T.block("store"):
+                                        i, j = T.axis.remap("SS", [a0, a1])
+                                        if tile_m_start + i < row[1] and tile_n_start + j < N:
+                                            O[tile_m_start + i, tile_n_start + j] = O_tile[i, j]
+                        # move to next tile
+                        cur_tile_cnt[0] += CTA_COUNT
+        # fmt: on
+
+        sch = tvm.tir.Schedule(dequantize_group_gemm)
+
+        main_block = sch.get_block("compute")
+        x, y, k = sch.get_loops(main_block)
+
+        ty, yi = sch.split(y, [TY, None])
+        tx, xi, vec_c = sch.split(x, [TX, None, VEC_DOT])
+        ko, ki = sch.split(k, factors=[None, BLK_K])
+        sch.reorder(ty, tx, ko, ki, yi, xi, vec_c)
+        sch.bind(ty, "threadIdx.y")
+        sch.bind(tx, "threadIdx.x")
+        sch.vectorize(vec_c)
+
+        if UNROLL > 0:
+            sch.annotate(tx, ann_key="pragma_auto_unroll_max_step", ann_val=UNROLL)
+            sch.annotate(tx, ann_key="pragma_unroll_explicit", ann_val=1)
+
+        l2g = sch.get_block("store")
+        sch.reverse_compute_at(l2g, tx, preserve_unit_loops=True)
+        _, v = sch.split(sch.get_loops(l2g)[-1], [None, VEC_O])
+        sch.vectorize(v)
+
+
+        def _cooperative_fetch(block, vec_len):
+            num_loops = len(sch.get_loops(block))
+            sch.compute_at(block, ko, preserve_unit_loops=True)
+            loops = sch.get_loops(block)[-num_loops:]
+            ty, tx, _, vec = sch.split(
+                sch.fuse(*loops),
+                factors=[TY, TX, None, vec_len],
+            )
+            sch.vectorize(vec)
+            sch.bind(ty, "threadIdx.y")
+            sch.bind(tx, "threadIdx.x")
+            if STORAGE_ALIGN:
+                sch.storage_align(block, 0, axis=1, factor=8, offset=vec_len)
+            return block
+
+
+        a_g2s = _cooperative_fetch(sch.get_block("X_shared"), vec_len=VEC_X)
+        b_g2s = _cooperative_fetch(sch.get_block("W_shared"), vec_len=VEC_W)
+
+        sch.decompose_reduction(main_block, ko)
+
+        func = sch.mod["main"]
+        bb = relax.BlockBuilder.current()
+        self.cnt +=1
+        gvar = bb.add_func(func, "dequantize_group_gemm_"+str(self.cnt))
+        return nn.op._wrap_nested(
+            bb.emit(
+                relax.call_tir(
+                    gvar,
+                    [input._expr, weight._expr, scale._expr, indptr._expr],
+                    out_sinfo=relax.TensorStructInfo(
+                        [input.shape[0], self.out_features], self.dtype
+                    ),
+                )
+            ),
+            name="dequantize_group_gemm_"+str(self.cnt),
         )
         
     @staticmethod
@@ -627,27 +803,7 @@ class GroupQuantizeMistralExperts(nn.Module):
                 return self.gemv_e1_e3(x, self.q_weight, self.q_scale, indptr)
             else:
                 return self.gemv_e2(x, self.q_weight, self.q_scale, indptr)
-            
-        bb = relax.BlockBuilder.current()
-        w = nn.op.tensor_expr_op(  # pylint: disable=invalid-name
-            lambda weight, scale: self.config._dequantize(  # pylint: disable=protected-access
-                weight,
-                scale,
-            ),
-            name_hint="dequantize",
-            args=[self.q_weight, self.q_scale],
-        )
-        return nn.op._wrap_nested(
-            bb.emit(
-                relax.call_dps_packed(
-                    "torch.groupgemm",
-                    [x._expr, w._expr, indptr._expr],
-                    out_sinfo=relax.TensorStructInfo((x.shape[0], self.out_features), w.dtype),
-                )
-            ),
-            name="groupgemm",
-        )
-
+        return self.group_gemm(x, weight=self.q_weight, scale=self.q_scale, indptr=indptr)
 
 def _apply_sharding(shard, name: str, weight: nn.Parameter):
     assert weight.ndim == 2

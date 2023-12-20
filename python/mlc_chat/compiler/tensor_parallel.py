@@ -7,53 +7,31 @@ from tvm.relax.frontend import nn
 
 
 @dataclasses.dataclass
-class Row:
-    """Shard a 2D tensor by its rows."""
+class Shard1Dim:
+    """Shard a tensor by one of its dimension."""
 
     name: str
-    row: int
-    col: int
+    shape: List[int]
+    dim: int
 
     def gen_tir(self, shards: int, weight: nn.Tensor) -> tir.PrimFunc:
         """Generate a TIR function that shards the weight tensor by its rows."""
-        assert weight.shape == [self.row, self.col]
-        w = te.placeholder([self.row * shards, self.col], weight.dtype, name="w")
-        o = topi.reshape(w, (shards, self.row, self.col))
+        assert weight.shape == self.shape
+        orig_shape = [self.shape[i] if i != self.dim else self.shape[self.dim] * shards for i in range(len(self.shape)) ]
+        reshape_shape = [*self.shape[: self.dim], shards, *self.shape[self.dim + 1:]]
+        transpose_index = [self.dim, *range(self.dim), *range(self.dim + 1, len(self.shape))]
+        w = te.placeholder(orig_shape, weight.dtype, name="w")
+        reshape = topi.reshape(w, reshape_shape)
+        o = topi.transpose(reshape, transpose_index)
         func = te.create_prim_func([w, o])
         return func
 
     def gen_shard_info(self, shards: int, weight: nn.Tensor) -> Dict[str, Any]:
         """Generate shard info for this sharding strategy."""
-        assert weight.shape == [self.row, self.col]
+        assert weight.shape == self.shape
         return {
             "func": self.name,
-            "out_shape": (shards, self.row, self.col),
-            "out_dtype": weight.dtype,
-        }
-
-
-@dataclasses.dataclass
-class Col:
-    """Shard a 2D tensor by its columns."""
-
-    name: str
-    row: int
-    col: int
-
-    def gen_tir(self, shards: int, weight: nn.Tensor) -> tir.PrimFunc:
-        """Generate a TIR function that shards the weight tensor by its columns."""
-        assert weight.shape == [self.row, self.col]
-        w = te.placeholder([self.row, self.col * shards], weight.dtype, name="w")
-        o = topi.transpose(topi.reshape(w, (self.row, shards, self.col)), (1, 0, 2))
-        func = te.create_prim_func([w, o])
-        return func
-
-    def gen_shard_info(self, shards: int, weight: nn.Tensor) -> Dict[str, Any]:
-        """Generate shard info for this sharding strategy."""
-        assert weight.shape == [self.row, self.col]
-        return {
-            "func_name": self.name,
-            "out_shape": (shards, self.row, self.col),
+            "out_shape": (shards, *self.shape),
             "out_dtype": weight.dtype,
         }
 

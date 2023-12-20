@@ -183,9 +183,9 @@ class LlamaDecoderLayer(nn.Module):
             v = self.self_attn.num_kv_heads * hd
             i = self.mlp.intermediate_size
             _set(self.self_attn.qkv_proj, tp.RowSeg("_shard_qkv", rows=[q, k, v], col=h, groups=hd))
-            _set(self.self_attn.o_proj, tp.Col("_shard_o", row=h, col=q))
+            _set(self.self_attn.o_proj, tp.Shard1Dim("_shard_o", shape=[h, q], axis=1))
             _set(self.mlp.gate_up_proj, tp.RowSeg("_shard_mlp_up", rows=[i, i], col=h, groups=1))
-            _set(self.mlp.down_proj, tp.Col("_shard_mlp_down", row=h, col=i))
+            _set(self.mlp.down_proj, tp.Shard1Dim("_shard_mlp_down", shape=[h, i], axis=1))
 
         self.tensor_parallel_shards = config.tensor_parallel_shards
         _set_tp()

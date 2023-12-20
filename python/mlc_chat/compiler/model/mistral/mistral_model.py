@@ -431,16 +431,17 @@ class MistralMoE(nn.Module):
         )
         self.num_experts_per_token = config.num_experts_per_token
         self.num_experts = config.num_experts
+        intermediate_size = config.intermediate_size // config.tensor_parallel_shards
         self.e1_e3 = MistralExperts(
             self.num_experts,
             self.num_experts_per_token,
             in_features=config.hidden_size,
-            out_features=2 * config.intermediate_size,
+            out_features=2 * intermediate_size,
         )
         self.e2 = MistralExperts(
             self.num_experts,
             self.num_experts_per_token,
-            in_features=config.intermediate_size,
+            in_features=intermediate_size,
             out_features=config.hidden_size,
         )
         self.dtype = "float32"

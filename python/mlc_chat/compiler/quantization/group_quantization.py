@@ -806,27 +806,20 @@ class GroupQuantizeMistralExperts(nn.Module):
         return self.group_gemm(x, weight=self.q_weight, scale=self.q_scale, indptr=indptr)
 
 def _apply_sharding(shard, name: str, weight: nn.Parameter):
-    assert weight.ndim == 2
-    if isinstance(shard, tp.Row):
-        assert weight.shape[0] == shard.row
-        weight.attrs["shard_strategy"] = tp.Row(
+    if isinstance(shard, tp.Shard1Dim):
+        weight.attrs["shard_strategy"] = tp.Shard1Dim(
             name=name,
-            row=weight.shape[0],
-            col=weight.shape[1],
+            shape=weight.shape,
+            dim=shard.dim,
         )
     elif isinstance(shard, tp.RowSeg):
+        assert weight.ndim == 2
         assert weight.shape[0] == sum(shard.rows)
         weight.attrs["shard_strategy"] = tp.RowSeg(
             name=name,
             rows=shard.rows,
             col=weight.shape[1],
             groups=shard.groups,
-        )
-    elif isinstance(shard, tp.Col):
-        weight.attrs["shard_strategy"] = tp.Col(
-            name=name,
-            row=weight.shape[0],
-            col=weight.shape[1],
         )
     else:
         raise NotImplementedError(f"Unknowing sharding strategy: {shard}")

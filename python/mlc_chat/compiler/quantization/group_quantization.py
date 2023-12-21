@@ -505,7 +505,7 @@ class GroupQuantizeMistralExperts(nn.Module):
                             
         bb = relax.BlockBuilder.current()
         gvar = bb.add_func(dequantize_gemv_e1_e3, "dequantize_gemv_e1_e3")
-        return nn.op._wrap_nested(
+        return nn.op.wrap_nested(
             bb.emit(
                 relax.call_tir(
                     gvar,
@@ -556,7 +556,7 @@ class GroupQuantizeMistralExperts(nn.Module):
                             
         bb = relax.BlockBuilder.current()
         gvar = bb.add_func(dequantize_gemv_e2, "dequantize_gemv_e2")
-        return nn.op._wrap_nested(
+        return nn.op.wrap_nested(
             bb.emit(
                 relax.call_tir(
                     gvar,
@@ -732,7 +732,7 @@ class GroupQuantizeMistralExperts(nn.Module):
         bb = relax.BlockBuilder.current()
         self.cnt +=1
         gvar = bb.add_func(func, "dequantize_group_gemm_"+str(self.cnt))
-        return nn.op._wrap_nested(
+        return nn.op.wrap_nested(
             bb.emit(
                 relax.call_tir(
                     gvar,

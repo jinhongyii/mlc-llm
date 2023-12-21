@@ -16,6 +16,7 @@ from tvm.topi.cuda.sort import topk
 from ....support import logging
 from ....support.config import ConfigBase
 from ....support.style import bold
+from ... import tensor_parallel as tp
 
 logger = logging.getLogger(__name__)
 
@@ -127,13 +128,13 @@ class MistralMLP(nn.Module):
 
     def __init__(self, config: MistralConfig):
         super().__init__()
-        intermediate_size = config.intermediate_size // config.tensor_parallel_shards
+        self.intermediate_size = config.intermediate_size // config.tensor_parallel_shards
         self.gate_up_proj = nn.Linear(
             in_features=config.hidden_size,
-            out_features=2 * intermediate_size,
+            out_features=2 * self.intermediate_size,
             bias=False,
         )
-        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x: Tensor):
         concat_x1_x2 = self.gate_up_proj(x)
@@ -179,7 +180,7 @@ class MistralExperts(nn.Module):
                             
         bb = rx.BlockBuilder.current()
         gvar = bb.add_func(_gemv_e1_e3, "gemv_e1_e3")
-        return op._wrap_nested(
+        return op.wrap_nested(
             bb.emit(
                 rx.call_tir(
                     gvar,
@@ -220,7 +221,7 @@ class MistralExperts(nn.Module):
                             
         bb = rx.BlockBuilder.current()
         gvar = bb.add_func(_gemv_e2, "gemv_e2")
-        return op._wrap_nested(
+        return op.wrap_nested(
             bb.emit(
                 rx.call_tir(
                     gvar,
@@ -395,7 +396,7 @@ class MistralExperts(nn.Module):
         bb = rx.BlockBuilder.current()
         self.cnt +=1
         gvar = bb.add_func(func, "group_gemm_"+str(self.cnt))
-        return nn.op._wrap_nested(
+        return nn.op.wrap_nested(
             bb.emit(
                 rx.call_tir(
                     gvar,
@@ -431,17 +432,17 @@ class MistralMoE(nn.Module):
         )
         self.num_experts_per_token = config.num_experts_per_token
         self.num_experts = config.num_experts
-        intermediate_size = config.intermediate_size // config.tensor_parallel_shards
-        self.e1_e3 = MistralExperts(
+        self.intermediate_size = config.intermediate_size // config.tensor_parallel_shards
+        self.gate_up_proj = MistralExperts(
             self.num_experts,
             self.num_experts_per_token,
             in_features=config.hidden_size,
-            out_features=2 * intermediate_size,
+            out_features=2 * self.intermediate_size,
         )
-        self.e2 = MistralExperts(
+        self.down_proj = MistralExperts(
             self.num_experts,
             self.num_experts_per_token,
-            in_features=intermediate_size,
+            in_features=self.intermediate_size,
             out_features=config.hidden_size,
         )
         self.dtype = "float32"
@@ -491,7 +492,7 @@ class MistralMoE(nn.Module):
             return op.tensor_expr_op(topk, "topk", args=[x, k, -1, "both", False, "int32"])
         bb = rx.BlockBuilder.current()
         gvar = bb.add_func(top2_func, "top2")
-        return op._wrap_nested(
+        return op.wrap_nested(
             bb.emit(
                 rx.call_tir(
                     gvar,
@@ -588,7 +589,7 @@ class MistralMoE(nn.Module):
 
         bb = rx.BlockBuilder.current()
         gvar = bb.add_func(get_flattened_expert_indices_scheduled, "get_flattened_expert_indices")
-        return op._wrap_nested(
+        return op.wrap_nested(
             bb.emit(
                 rx.call_tir(
                     gvar,
@@ -627,7 +628,7 @@ class MistralMoE(nn.Module):
 
         bb = rx.BlockBuilder.current()
         gvar = bb.add_func(get_expert_instance_indptr, "get_expert_instance_indptr")
-        return op._wrap_nested(
+        return op.wrap_nested(
             bb.emit(
                 rx.call_tir(
                     gvar,
@@ -674,7 +675,7 @@ class MistralMoE(nn.Module):
 
         bb = rx.BlockBuilder.current()
         gvar = bb.add_func(tir_scatter_output, "scatter_output")
-        return op._wrap_nested(
+        return op.wrap_nested(
             bb.emit(
                 rx.call_tir(
                     gvar,
@@ -711,9 +712,9 @@ class MistralMoE(nn.Module):
         if num_tokens == 1:
             #single batch decode
             expert_indices = op.reshape(expert_indices, (self.num_experts_per_token,))
-            concat_x1_x3 = self.e1_e3(x, expert_indices, single_batch_decode=True)
+            concat_x1_x3 = self.gate_up_proj(x, expert_indices, single_batch_decode=True)
             x1, x3 = op.split(concat_x1_x3, indices_or_sections=2, axis=-1)
-            linear_out = self.e2(op.silu(x1) * x3, expert_indices, single_batch_decode=True)
+            linear_out = self.down_proj(op.silu(x1) * x3, expert_indices, single_batch_decode=True)
             unflattened = op.reshape(linear_out, (num_tokens, self.num_experts_per_token, linear_out.shape[-1]))
         else:
             expert_mask = self.topk_mask(expert_indices)
@@ -727,9 +728,9 @@ class MistralMoE(nn.Module):
             gathered_x = op.take(x, token_indices, axis=0)
 
             # MLP forward begin
-            concat_x1_x3 = self.e1_e3(gathered_x, indptr)
+            concat_x1_x3 = self.gate_up_proj(gathered_x, indptr)
             x1, x3 = op.split(concat_x1_x3, indices_or_sections=2, axis=-1)
-            linear_out = self.e2(op.silu(x1) * x3, indptr)
+            linear_out = self.down_proj(op.silu(x1) * x3, indptr)
             # MLP forward end
 
             # MoE result post-processing
@@ -933,7 +934,20 @@ class MistralDecoderLayer(nn.Module):
         self.mlp = MistralMLP(config) if config.num_experts == 0 else MistralMoE(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, -1, rms_norm_eps, bias=False)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, -1, rms_norm_eps, bias=False)
+        def _set_tp():
+            def _set(layer, hint):
+                layer.weight.attrs["shard_strategy"] = hint
 
+            h = config.hidden_size
+            hd = config.head_dim
+            q = self.self_attn.num_q_heads * hd
+            k = self.self_attn.num_kv_heads * hd
+            v = self.self_attn.num_kv_heads * hd
+            i = self.mlp.intermediate_size
+            _set(self.self_attn.qkv_proj, tp.RowSeg("_shard_qkv", rows=[q, k, v], col=h, groups=hd))
+            _set(self.self_attn.o_proj, tp.Shard1Dim("_shard_o", shape=self.self_attn.o_proj.weight.shape, axis=1))
+            _set(self.mlp.gate_up_proj, tp.RowSeg("_shard_mlp_up", rows=[i, i], col=h, groups=1))
+            _set(self.mlp.down_proj, tp.Shard1Dim("_shard_mlp_down", shape=self.mlp.down_proj.weight.shape, axis=1))
         self.tensor_parallel_shards = config.tensor_parallel_shards
 
     def forward(  # pylint: disable=too-many-arguments

@@ -809,17 +809,13 @@ def _apply_sharding(shard, name: str, weight: nn.Parameter):
     if isinstance(shard, tp.Shard1Dim):
         weight.attrs["shard_strategy"] = tp.Shard1Dim(
             name=name,
-            shape=weight.shape,
             dim=shard.dim,
         )
-    elif isinstance(shard, tp.RowSeg):
-        assert weight.ndim == 2
-        assert weight.shape[0] == sum(shard.rows)
-        weight.attrs["shard_strategy"] = tp.RowSeg(
+    elif isinstance(shard, tp.Shard1DimSeg):
+        weight.attrs["shard_strategy"] = tp.Shard1DimSeg(
             name=name,
-            rows=shard.rows,
-            col=weight.shape[1],
-            groups=shard.groups,
+            dim=shard.dim,
+            segs=shard.segs,
         )
     else:
         raise NotImplementedError(f"Unknowing sharding strategy: {shard}")

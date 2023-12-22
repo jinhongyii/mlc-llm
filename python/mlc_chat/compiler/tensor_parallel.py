@@ -11,15 +11,13 @@ class Shard1Dim:
     """Shard a tensor by one of its dimension."""
 
     name: str
-    shape: List[int]
     dim: int
 
     def gen_tir(self, shards: int, weight: nn.Tensor) -> tir.PrimFunc:
         """Generate a TIR function that shards the weight tensor by its rows."""
-        assert weight.shape == self.shape
-        orig_shape = [self.shape[i] if i != self.dim else self.shape[self.dim] * shards for i in range(len(self.shape)) ]
-        reshape_shape = [*self.shape[: self.dim], shards, *self.shape[self.dim + 1:]]
-        transpose_index = [self.dim, *range(self.dim), *range(self.dim + 1, len(self.shape))]
+        orig_shape = [weight.shape[i] if i != self.dim else weight.shape[self.dim] * shards for i in range(len(weight.shape)) ]
+        reshape_shape = [*weight.shape[: self.dim], shards, weight.shape[self.dim], *weight.shape[self.dim + 1:]]
+        transpose_index = [self.dim, *range(self.dim), *range(self.dim + 1, len(weight.shape)+1)]
         w = te.placeholder(orig_shape, weight.dtype, name="w")
         reshape = topi.reshape(w, reshape_shape)
         o = topi.transpose(reshape, transpose_index)
@@ -28,17 +26,16 @@ class Shard1Dim:
 
     def gen_shard_info(self, shards: int, weight: nn.Tensor) -> Dict[str, Any]:
         """Generate shard info for this sharding strategy."""
-        assert weight.shape == self.shape
         return {
-            "func": self.name,
-            "out_shape": (shards, *self.shape),
+            "func_name": self.name,
+            "out_shape": (shards, *weight.shape),
             "out_dtype": weight.dtype,
         }
 
 
 @dataclasses.dataclass
-class RowSeg:
-    """Shard a 2D tensor by its "segmented" rows, where each segment has a different number of rows
+class Shard1DimSeg:
+    """Shard a tensor by its "segmented" dimension, where each segment has a different shape along the dimension
     and sharded evenly on each worker.
 
 
@@ -60,43 +57,36 @@ class RowSeg:
     """
 
     name: str
-    rows: List[int]
-    col: int
-    groups: int
-
-    @property
-    def row(self) -> int:
-        """Number of rows in total"""
-        return sum(self.rows)
+    dim: int
+    segs: List[int]
 
     def gen_tir(self, shards: int, weight: nn.Tensor) -> tir.PrimFunc:
         """Generate a TIR function that shards the weight tensor by its row segments."""
-        assert weight.shape == [self.row, self.col]
-        w = te.placeholder([self.row * shards, self.col], weight.dtype, name="w")
+        shape = weight.shape
+        assert sum(self.segs) == shape[self.dim]
+        w = te.placeholder([*shape[:self.dim], shape[self.dim] * shards, *shape[self.dim+1:]], weight.dtype, name="w")
         ws: List[te.Tensor] = []
         offset = 0
-        for idx, sub_row in enumerate(self.rows):
-            assert sub_row % self.groups == 0
+        for idx, sub_seg in enumerate(self.segs):
             ws.append(
                 topi.reshape(
                     te.compute(
-                        (shards * sub_row, self.col),
-                        lambda i, j: w[i + offset, j],  # pylint: disable=cell-var-from-loop
+                        (*shape[:self.dim], sub_seg * shards, *shape[self.dim+1:]),
+                        lambda *idx: w[idx[:self.dim]+(idx[self.dim]+offset,)+idx[self.dim+1:]],  # pylint: disable=cell-var-from-loop
                         name=f"w_{idx}",
                     ),
-                    (shards, sub_row // self.groups, self.groups, self.col),
+                    (shards, *shape[:self.dim], sub_seg, *shape[self.dim+1:]),
                 )
             )
-            offset += sub_row * shards
-        o = topi.reshape(topi.concatenate(ws, axis=1), (shards, self.row, self.col))
+            offset += sub_seg * shards
+        o = topi.concatenate(ws, axis=1)
         func = te.create_prim_func([w, o])
         return func
 
     def gen_shard_info(self, shards: int, weight: nn.Tensor) -> Dict[str, Any]:
         """Generate shard info for this sharding strategy."""
-        assert weight.shape == [self.row, self.col]
         return {
             "func_name": self.name,
-            "out_shape": (shards, self.row, self.col),
+            "out_shape": (shards, *weight.shape),
             "out_dtype": weight.dtype,
         }

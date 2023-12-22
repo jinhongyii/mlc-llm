@@ -84,6 +84,20 @@ MODELS: Dict[str, Model] = {
             "group-quant": mistral_quantization.group_quant,
         },
     ),
+    "mixtral": Model(
+        name="mixtral",
+        model=mistral_model.MistralForCasualLM,
+        config=mistral_model.MistralConfig,
+        source={
+            "huggingface-torch": mistral_loader.huggingface,
+            "huggingface-safetensor": mistral_loader.huggingface,
+            "awq": mistral_loader.awq,
+        },
+        quantize={
+            "no-quant": mistral_quantization.no_quant,
+            "group-quant": mistral_quantization.group_quant,
+        },
+    ),
     "gpt2": Model(
         name="gpt2",
         model=gpt2_model.GPT2LMHeadModel,

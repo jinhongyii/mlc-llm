@@ -69,17 +69,20 @@ class Shard1DimSeg:
         offset = 0
         for idx, sub_seg in enumerate(self.segs):
             ws.append(
-                topi.reshape(
-                    te.compute(
-                        (*shape[:self.dim], sub_seg * shards, *shape[self.dim+1:]),
-                        lambda *idx: w[idx[:self.dim]+(idx[self.dim]+offset,)+idx[self.dim+1:]],  # pylint: disable=cell-var-from-loop
-                        name=f"w_{idx}",
+                topi.transpose(
+                    topi.reshape(
+                        te.compute(
+                            (*shape[:self.dim], sub_seg * shards, *shape[self.dim+1:]),
+                            lambda *idx: w[idx[:self.dim]+(idx[self.dim]+offset,)+idx[self.dim+1:]],  # pylint: disable=cell-var-from-loop
+                            name=f"w_{idx}",
+                        ),
+                        (*shape[:self.dim], shards, sub_seg, *shape[self.dim+1:]),
                     ),
-                    (shards, *shape[:self.dim], sub_seg, *shape[self.dim+1:]),
+                    [self.dim, *range(self.dim), *range(self.dim+1, len(shape)+1)]
                 )
             )
             offset += sub_seg * shards
-        o = topi.concatenate(ws, axis=1)
+        o = topi.concatenate(ws, axis=1+self.dim)
         func = te.create_prim_func([w, o])
         return func
 

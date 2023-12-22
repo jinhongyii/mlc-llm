@@ -448,18 +448,18 @@ class GroupQuantizeEmbedding(nn.Module):
 
 
 class GroupQuantizeMistralExperts(nn.Module):
-    def __init__(self, num_experts, num_experts_per_token, in_features, out_features, config: GroupQuantize):
-        self.num_experts = num_experts
-        self.num_experts_per_token = num_experts_per_token
+    def __init__(self, num_local_experts, num_experts_per_tok, in_features, out_features, config: GroupQuantize):
+        self.num_local_experts = num_local_experts
+        self.num_experts_per_tok = num_experts_per_tok
         self.in_features = in_features
         self.out_features = out_features
         self.config = config
         num_group = tir.ceildiv(in_features, config.group_size)
         self.q_weight = nn.Parameter(
-            (num_experts, out_features, config.num_storage_per_group * num_group),
+            (num_local_experts, out_features, config.num_storage_per_group * num_group),
             config.storage_dtype,
         )
-        self.q_scale = nn.Parameter((num_experts, out_features, num_group), config.model_dtype)
+        self.q_scale = nn.Parameter((num_local_experts, out_features, num_group), config.model_dtype)
         self.dtype = config.model_dtype
         self.cnt = 0
 
@@ -472,14 +472,14 @@ class GroupQuantizeMistralExperts(nn.Module):
         def dequantize_gemv_e1_e3(var_x: T.handle, var_w: T.handle, var_scale:T.handle, var_indptr: T.handle, var_o: T.handle):
             T.func_attr({"op_pattern": 4})
             x = T.match_buffer(var_x, (1, self.in_features), self.dtype)
-            w = T.match_buffer(var_w, (self.num_experts, self.out_features, self.in_features //self.config.num_elem_per_storage), self.config.storage_dtype)
-            scale = T.match_buffer(var_scale, (self.num_experts, self.out_features, self.in_features//self.config.group_size), self.dtype)
-            indptr = T.match_buffer(var_indptr, (self.num_experts_per_token,), "int32")
-            o = T.match_buffer(var_o, (self.num_experts_per_token, self.out_features), self.dtype)
+            w = T.match_buffer(var_w, (self.num_local_experts, self.out_features, self.in_features //self.config.num_elem_per_storage), self.config.storage_dtype)
+            scale = T.match_buffer(var_scale, (self.num_local_experts, self.out_features, self.in_features//self.config.group_size), self.dtype)
+            indptr = T.match_buffer(var_indptr, (self.num_experts_per_tok,), "int32")
+            o = T.match_buffer(var_o, (self.num_experts_per_tok, self.out_features), self.dtype)
             # with T.block("root"):
-            for expert_id in T.thread_binding(self.num_experts_per_token, thread="blockIdx.y"):
+            for expert_id in T.thread_binding(self.num_experts_per_tok, thread="blockIdx.y"):
                 with T.block("gemv_o"):
-                    v_expert_id_o = T.axis.spatial(self.num_experts_per_token, expert_id)
+                    v_expert_id_o = T.axis.spatial(self.num_experts_per_tok, expert_id)
                     vi_o = T.axis.spatial(1, 0)
                     vj_o = T.axis.reduce(1, 0)
                     compute = T.alloc_buffer((self.out_features, self.in_features), self.dtype)
@@ -524,15 +524,15 @@ class GroupQuantizeMistralExperts(nn.Module):
         @T.prim_func
         def dequantize_gemv_e2(var_x: T.handle, var_w: T.handle, var_scale:T.handle, var_indptr: T.handle, var_o: T.handle):
             T.func_attr({"op_pattern": 4})
-            x = T.match_buffer(var_x, (self.num_experts_per_token, self.in_features), self.dtype)
-            w = T.match_buffer(var_w, (self.num_experts, self.out_features, self.in_features //self.config.num_elem_per_storage), self.config.storage_dtype)
-            scale = T.match_buffer(var_scale, (self.num_experts, self.out_features, self.in_features//self.config.group_size), self.dtype)
-            indptr = T.match_buffer(var_indptr, (self.num_experts_per_token, ), "int32")
-            o = T.match_buffer(var_o, (self.num_experts_per_token, self.out_features), self.dtype)
+            x = T.match_buffer(var_x, (self.num_experts_per_tok, self.in_features), self.dtype)
+            w = T.match_buffer(var_w, (self.num_local_experts, self.out_features, self.in_features //self.config.num_elem_per_storage), self.config.storage_dtype)
+            scale = T.match_buffer(var_scale, (self.num_local_experts, self.out_features, self.in_features//self.config.group_size), self.dtype)
+            indptr = T.match_buffer(var_indptr, (self.num_experts_per_tok, ), "int32")
+            o = T.match_buffer(var_o, (self.num_experts_per_tok, self.out_features), self.dtype)
             # with T.block("root"):
-            for expert_id in T.thread_binding(self.num_experts_per_token, thread="blockIdx.y"):
+            for expert_id in T.thread_binding(self.num_experts_per_tok, thread="blockIdx.y"):
                 with T.block("gemv_o"):
-                    v_expert_id_o = T.axis.spatial(self.num_experts_per_token, expert_id)
+                    v_expert_id_o = T.axis.spatial(self.num_experts_per_tok, expert_id)
                     vi_o = T.axis.spatial(1, 0)
                     vj_o = T.axis.reduce(1, 0)
                     compute = T.alloc_buffer((self.out_features, self.in_features), self.dtype)
@@ -570,7 +570,7 @@ class GroupQuantizeMistralExperts(nn.Module):
         )
         
     def group_gemm(self, input: nn.Tensor, weight: nn.Tensor, scale: nn.Tensor, indptr: nn.Tensor):
-        Ne = self.num_experts
+        Ne = self.num_local_experts
         N = self.out_features
         K = self.in_features
         bits = DataType(self.config.quantize_dtype).bits
@@ -766,12 +766,16 @@ class GroupQuantizeMistralExperts(nn.Module):
             The group quantized GroupQuantizeMistralExperts layer.
         """
         quantized_mistral_experts = GroupQuantizeMistralExperts(
-            num_experts=src.num_experts,
-            num_experts_per_token=src.num_experts_per_token,
+            num_local_experts=src.num_local_experts,
+            num_experts_per_tok=src.num_experts_per_tok,
             in_features=src.in_features,
             out_features=src.out_features,
             config=config,
         )
+        if "shard_strategy" in src.weight.attrs:
+            shard = src.weight.attrs["shard_strategy"]
+            _apply_sharding(shard, f"{shard.name}_q_weight", quantized_mistral_experts.q_weight)
+            _apply_sharding(shard, f"{shard.name}_q_scale", quantized_mistral_experts.q_scale)
         return quantized_mistral_experts
 
     def forward(self, x: nn.Tensor, indptr: nn.Tensor, single_batch_decode: bool = False) -> nn.Tensor:  # pylint: disable=invalid-name

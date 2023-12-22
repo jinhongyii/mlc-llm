@@ -72,8 +72,9 @@ def huggingface(model_config: MistralConfig, quantization: Quantization) -> Exte
             )
         else:
             # Add gates in MLP (when MoE is enabled)
-            mlp = f"model.layers.{i}.mlp"
-            mlc_name = f"{mlp}.e1_e3.weight"
+            mlp = f"model.layers.{i}.block_sparse_moe"
+            mlc_mlp = f"model.layers.{i}.mlp"
+            mlc_name = f"{mlc_mlp}.e1_e3.weight"
             mlc_param = named_parameters[mlc_name]
 
             def combine_expert_gate_up(*hf_params, dtype):
@@ -91,7 +92,7 @@ def huggingface(model_config: MistralConfig, quantization: Quantization) -> Exte
                             f"{mlp}.experts.{expert_id}.w1.weight",
                             f"{mlp}.experts.{expert_id}.w3.weight",
                         ]
-                        for expert_id in range(model_config.num_experts)
+                        for expert_id in range(model_config.num_local_experts)
                     ],
                 ),
                 functools.partial(
@@ -100,19 +101,33 @@ def huggingface(model_config: MistralConfig, quantization: Quantization) -> Exte
                 ),
             )
 
-            mlc_name = f"{mlp}.e2.weight"
+            mlc_name = f"{mlc_mlp}.e2.weight"
             mlc_param = named_parameters[mlc_name]
             mapping.add_mapping(
                 mlc_name,
                 [
                     f"{mlp}.experts.{expert_id}.w2.weight"
-                    for expert_id in range(model_config.num_experts)
+                    for expert_id in range(model_config.num_local_experts)
                 ],
                 functools.partial(
                     lambda *hf_params, dtype: np.stack(hf_params, axis=0).astype(dtype),
                     dtype=mlc_param.dtype,
                 ),
             )
+            
+            mlc_name = f"{mlc_mlp}.gate.weight"
+            mlc_param = named_parameters[mlc_name]
+            mapping.add_mapping(
+                mlc_name,
+                [
+                    f"{mlp}.gate.weight"
+                ],
+                functools.partial(
+                    lambda x, dtype: x.astype(dtype),
+                    dtype=mlc_param.dtype,
+                ),
+            )
+                
 
         # inv_freq is not used in the model
         mapping.add_unused(f"{attn}.rotary_emb.inv_freq")

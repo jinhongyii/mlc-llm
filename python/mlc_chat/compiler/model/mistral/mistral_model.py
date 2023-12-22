@@ -28,8 +28,6 @@ class MistralConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     hidden_size: int
     intermediate_size: int
     num_attention_heads: int
-    num_experts: int
-    num_experts_per_token: int
     num_hidden_layers: int
     rms_norm_eps: float
     vocab_size: int
@@ -41,6 +39,8 @@ class MistralConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     prefill_chunk_size: int = 0
     attention_sink_size: int = 4
     tensor_parallel_shards: int = 1
+    num_local_experts: int = 0
+    num_experts_per_tok: int = 0
     kwargs: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
@@ -143,12 +143,12 @@ class MistralMLP(nn.Module):
 
 
 class MistralExperts(nn.Module):
-    def __init__(self, num_experts, num_experts_per_token, in_features, out_features):
-        self.num_experts = num_experts
-        self.num_experts_per_token = num_experts_per_token  
+    def __init__(self, num_local_experts, num_experts_per_tok, in_features, out_features):
+        self.num_local_experts = num_local_experts
+        self.num_experts_per_tok = num_experts_per_tok  
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = nn.Parameter((num_experts, out_features, in_features))
+        self.weight = nn.Parameter((num_local_experts, out_features, in_features))
         self.dtype = "float32"
         self.cnt = 0
 
@@ -158,13 +158,13 @@ class MistralExperts(nn.Module):
         def _gemv_e1_e3(var_x: T.handle, var_w: T.handle, var_indptr: T.handle, var_o: T.handle):
             T.func_attr({"op_pattern": 4})
             x = T.match_buffer(var_x, (1, self.in_features), self.dtype)
-            w = T.match_buffer(var_w, (self.num_experts, self.out_features, self.in_features), self.dtype)
-            indptr = T.match_buffer(var_indptr, (self.num_experts_per_token,), "int32")
-            o = T.match_buffer(var_o, (self.num_experts_per_token, self.out_features), self.dtype)
+            w = T.match_buffer(var_w, (self.num_local_experts, self.out_features, self.in_features), self.dtype)
+            indptr = T.match_buffer(var_indptr, (self.num_experts_per_tok,), "int32")
+            o = T.match_buffer(var_o, (self.num_experts_per_tok, self.out_features), self.dtype)
             # with T.block("root"):
-            for expert_id in T.thread_binding(self.num_experts_per_token, thread="blockIdx.y"):
+            for expert_id in T.thread_binding(self.num_experts_per_tok, thread="blockIdx.y"):
                 with T.block("gemv_o"):
-                    v_expert_id_o = T.axis.spatial(self.num_experts_per_token, expert_id)
+                    v_expert_id_o = T.axis.spatial(self.num_experts_per_tok, expert_id)
                     vi_o = T.axis.spatial(1, 0)
                     vj_o = T.axis.reduce(1, 0)
                     T.reads(x[0, 0:self.in_features], w[indptr[v_expert_id_o], 0:self.out_features, 0:self.in_features], indptr[v_expert_id_o])
@@ -198,14 +198,14 @@ class MistralExperts(nn.Module):
         @T.prim_func
         def _gemv_e2(var_x: T.handle, var_w: T.handle, var_indptr: T.handle, var_o: T.handle):
             T.func_attr({"op_pattern": 4})
-            x = T.match_buffer(var_x, (self.num_experts_per_token, self.in_features), self.dtype)
-            w = T.match_buffer(var_w, (self.num_experts, self.out_features, self.in_features), self.dtype)
-            indptr = T.match_buffer(var_indptr, (self.num_experts_per_token,), "int32")
-            o = T.match_buffer(var_o, (self.num_experts_per_token, self.out_features), self.dtype)
+            x = T.match_buffer(var_x, (self.num_experts_per_tok, self.in_features), self.dtype)
+            w = T.match_buffer(var_w, (self.num_local_experts, self.out_features, self.in_features), self.dtype)
+            indptr = T.match_buffer(var_indptr, (self.num_experts_per_tok,), "int32")
+            o = T.match_buffer(var_o, (self.num_experts_per_tok, self.out_features), self.dtype)
             # with T.block("root"):
-            for expert_id in T.thread_binding(self.num_experts_per_token, thread="blockIdx.y"):
+            for expert_id in T.thread_binding(self.num_experts_per_tok, thread="blockIdx.y"):
                 with T.block("gemv_o"):
-                    v_expert_id_o = T.axis.spatial(self.num_experts_per_token, expert_id)
+                    v_expert_id_o = T.axis.spatial(self.num_experts_per_tok, expert_id)
                     vi_o = T.axis.spatial(1, 0)
                     vj_o = T.axis.reduce(1, 0)
                     T.reads(x[v_expert_id_o, 0:self.in_features], w[indptr[v_expert_id_o], 0:self.out_features, 0:self.in_features], indptr[v_expert_id_o])
@@ -236,7 +236,7 @@ class MistralExperts(nn.Module):
         
     def group_gemm(self, input: nn.Tensor, weight: nn.Tensor, indptr: nn.Tensor):
 
-        Ne = self.num_experts
+        Ne = self.num_local_experts
         N = self.out_features
         K = self.in_features
 
@@ -428,20 +428,20 @@ class MistralMoE(nn.Module):
     def __init__(self, config: MistralConfig):
         super().__init__()
         self.gate = nn.Linear(
-            in_features=config.hidden_size, out_features=config.num_experts, bias=False
+            in_features=config.hidden_size, out_features=config.num_local_experts, bias=False
         )
-        self.num_experts_per_token = config.num_experts_per_token
-        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.num_local_experts = config.num_local_experts
         self.intermediate_size = config.intermediate_size // config.tensor_parallel_shards
-        self.gate_up_proj = MistralExperts(
-            self.num_experts,
-            self.num_experts_per_token,
+        self.e1_e3 = MistralExperts(
+            self.num_local_experts,
+            self.num_experts_per_tok,
             in_features=config.hidden_size,
             out_features=2 * self.intermediate_size,
         )
-        self.down_proj = MistralExperts(
-            self.num_experts,
-            self.num_experts_per_token,
+        self.e2 = MistralExperts(
+            self.num_local_experts,
+            self.num_experts_per_tok,
             in_features=self.intermediate_size,
             out_features=config.hidden_size,
         )
@@ -457,7 +457,7 @@ class MistralMoE(nn.Module):
             out_index_handle: T.handle,
         ) -> None:
             total_rows = T.int64()
-            x = T.match_buffer(x_handle, (total_rows, self.num_experts), self.dtype)
+            x = T.match_buffer(x_handle, (total_rows, self.num_local_experts), self.dtype)
             out = T.match_buffer(out_handle, (total_rows, 2), self.dtype)
             out_index = T.match_buffer(out_index_handle, (total_rows, 2), index_dtype)
             local_top_k = T.alloc_buffer((2,), dtype=self.dtype, scope="local")
@@ -471,7 +471,7 @@ class MistralMoE(nn.Module):
                         with T.block("init"):
                             local_top_k[0] = T.min_value(self.dtype)
                             local_top_k_index[0] = 0
-                        for k in range(self.num_experts):
+                        for k in range(self.num_local_experts):
                             with T.block("update"):
                                 vk = T.axis.remap("S", [k])
                                 if x[vi, vk] > local_top_k[0]:
@@ -515,13 +515,13 @@ class MistralMoE(nn.Module):
 
         def te_topk_mask_op(topk_indices):
             ntokens = topk_indices.shape[0]
-            assert topk_indices.shape[1] == self.num_experts_per_token
+            assert topk_indices.shape[1] == self.num_experts_per_tok
             return te.compute(
-                (ntokens, self.num_experts),
+                (ntokens, self.num_local_experts),
                 lambda i, j: tir.expr.Select(
                     reduce(
                         lambda a, b: tir.Or(a, b),
-                        [topk_indices[i, k] == j for k in range(self.num_experts_per_token)],
+                        [topk_indices[i, k] == j for k in range(self.num_experts_per_tok)],
                     ),
                     true_value=tir.const(1, "int32"),
                     false_value=tir.const(0, "int32"),
@@ -546,11 +546,11 @@ class MistralMoE(nn.Module):
                 var_cumsum_colwise_flattened, shape=[cumsum_flattened_length], dtype="int32"
             )
             expert_indices = T.match_buffer(
-                var_expert_indices, shape=[batch_size, self.num_experts_per_token], dtype="int32"
+                var_expert_indices, shape=[batch_size, self.num_experts_per_tok], dtype="int32"
             )
             flattened_expert_indices = T.match_buffer(
                 var_flattened_expert_indices,
-                shape=[batch_size * self.num_experts_per_token],
+                shape=[batch_size * self.num_experts_per_tok],
                 dtype="int32",
             )
 
@@ -574,9 +574,9 @@ class MistralMoE(nn.Module):
                                 vi, batch_size
                             )
                             expert_id: T.SizeVar("expert_id", "int32") = T.truncdiv(vi, batch_size)
-                            for j in T.serial(0, self.num_experts_per_token):
+                            for j in T.serial(0, self.num_experts_per_tok):
                                 with T.block("select_expert"):
-                                    vj = T.axis.spatial(self.num_experts_per_token, j)
+                                    vj = T.axis.spatial(self.num_experts_per_tok, j)
                                     vinstance_id = T.axis.spatial(batch_size, instance_id)
                                     vexpert_id = T.axis.spatial(
                                         T.truncdiv(cumsum_flattened_length, batch_size), expert_id
@@ -584,7 +584,7 @@ class MistralMoE(nn.Module):
                                     if expert_indices[vinstance_id, vj] == vexpert_id:
                                         expert_idx[()] = vj
                             flattened_expert_indices[idx] = (
-                                instance_id * self.num_experts_per_token + expert_idx[()]
+                                instance_id * self.num_experts_per_tok + expert_idx[()]
                             )
 
         bb = rx.BlockBuilder.current()
@@ -595,7 +595,7 @@ class MistralMoE(nn.Module):
                     gvar,
                     [cumsum_colwise_flattened._expr, expert_indices._expr],
                     out_sinfo=rx.TensorStructInfo(
-                        [expert_indices.shape[0] * self.num_experts_per_token], "int32"
+                        [expert_indices.shape[0] * self.num_experts_per_tok], "int32"
                     ),
                 )
             ),
@@ -611,15 +611,15 @@ class MistralMoE(nn.Module):
             batch_size: T.int32,
         ):
             cumsum_colwise_flattened = T.match_buffer(
-                var_cumsum_colwise_flattened, shape=[batch_size * self.num_experts], dtype="int32"
+                var_cumsum_colwise_flattened, shape=[batch_size * self.num_local_experts], dtype="int32"
             )
             expert_instance_indptr = T.match_buffer(
-                var_expert_instance_indptr, shape=[self.num_experts + 1], dtype="int32"
+                var_expert_instance_indptr, shape=[self.num_local_experts + 1], dtype="int32"
             )
 
-            for expert_id in T.serial(0, self.num_experts + 1):
+            for expert_id in T.serial(0, self.num_local_experts + 1):
                 with T.block("indptr"):
-                    vexpert_id = T.axis.spatial(self.num_experts + 1, expert_id)
+                    vexpert_id = T.axis.spatial(self.num_local_experts + 1, expert_id)
                     expert_instance_indptr[vexpert_id] = T.Select(
                         condition=vexpert_id > 0,
                         true_value=cumsum_colwise_flattened[vexpert_id * batch_size - 1],
@@ -633,8 +633,8 @@ class MistralMoE(nn.Module):
                 rx.call_tir(
                     gvar,
                     [cumsum_colwise_flattened._expr],
-                    out_sinfo=rx.TensorStructInfo([self.num_experts + 1], "int32"),
-                    tir_vars=[cumsum_colwise_flattened.shape[0] // self.num_experts],
+                    out_sinfo=rx.TensorStructInfo([self.num_local_experts + 1], "int32"),
+                    tir_vars=[cumsum_colwise_flattened.shape[0] // self.num_local_experts],
                 )
             ),
             name="expert_instance_indptr",
@@ -687,7 +687,7 @@ class MistralMoE(nn.Module):
         )
 
     def sum(self, x):
-        if self.num_experts_per_token == 2:
+        if self.num_experts_per_tok == 2:
             def te_add(x):
                 new_shape = (x.shape[0], x.shape[2])
                 return te.compute(
@@ -707,15 +707,15 @@ class MistralMoE(nn.Module):
 
         # MoE data preparation
         gate: Tensor = self.gate(x)
-        expert_weights, expert_indices = self.topk(gate, self.num_experts_per_token)
+        expert_weights, expert_indices = self.topk(gate, self.num_experts_per_tok)
         expert_weights = op.softmax(expert_weights, axis=-1)
         if num_tokens == 1:
             #single batch decode
-            expert_indices = op.reshape(expert_indices, (self.num_experts_per_token,))
-            concat_x1_x3 = self.gate_up_proj(x, expert_indices, single_batch_decode=True)
+            expert_indices = op.reshape(expert_indices, (self.num_experts_per_tok,))
+            concat_x1_x3 = self.e1_e3(x, expert_indices, single_batch_decode=True)
             x1, x3 = op.split(concat_x1_x3, indices_or_sections=2, axis=-1)
-            linear_out = self.down_proj(op.silu(x1) * x3, expert_indices, single_batch_decode=True)
-            unflattened = op.reshape(linear_out, (num_tokens, self.num_experts_per_token, linear_out.shape[-1]))
+            linear_out = self.e2(op.silu(x1) * x3, expert_indices, single_batch_decode=True)
+            unflattened = op.reshape(linear_out, (num_tokens, self.num_experts_per_tok, linear_out.shape[-1]))
         else:
             expert_mask = self.topk_mask(expert_indices)
             mask_T_flattened = op.reshape(
@@ -724,21 +724,21 @@ class MistralMoE(nn.Module):
             cumsum_colwise_flattened = self.cumsum(mask_T_flattened, dim=0)
             flattened_indices = self.get_indices(cumsum_colwise_flattened, expert_indices)
             indptr = self.get_indptr(cumsum_colwise_flattened)
-            token_indices = op.divide(flattened_indices, Tensor.from_const(self.num_experts_per_token))
+            token_indices = op.divide(flattened_indices, Tensor.from_const(self.num_experts_per_tok))
             gathered_x = op.take(x, token_indices, axis=0)
 
             # MLP forward begin
-            concat_x1_x3 = self.gate_up_proj(gathered_x, indptr)
+            concat_x1_x3 = self.e1_e3(gathered_x, indptr)
             x1, x3 = op.split(concat_x1_x3, indices_or_sections=2, axis=-1)
-            linear_out = self.down_proj(op.silu(x1) * x3, indptr)
+            linear_out = self.e2(op.silu(x1) * x3, indptr)
             # MLP forward end
 
             # MoE result post-processing
             unpermuted = self.scatter_output(flattened_indices, linear_out)
             unflattened = op.reshape(
-                unpermuted, (num_tokens, self.num_experts_per_token, unpermuted.shape[1])
+                unpermuted, (num_tokens, self.num_experts_per_tok, unpermuted.shape[1])
             )
-        expert_weights = op.reshape(expert_weights, (num_tokens, self.num_experts_per_token, 1))
+        expert_weights = op.reshape(expert_weights, (num_tokens, self.num_experts_per_tok, 1))
         weighted_sum = self.sum(unflattened * expert_weights)
         weighted_sum = op.reshape(
             weighted_sum, (input_shape[0], input_shape[1], weighted_sum.shape[-1])
@@ -931,7 +931,7 @@ class MistralDecoderLayer(nn.Module):
     def __init__(self, config: MistralConfig, rotary_embedding: RotaryEmbedding):
         rms_norm_eps = config.rms_norm_eps
         self.self_attn = MistralAttention(config, rotary_embedding)
-        self.mlp = MistralMLP(config) if config.num_experts == 0 else MistralMoE(config)
+        self.mlp = MistralMLP(config) if config.num_local_experts == 0 else MistralMoE(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, -1, rms_norm_eps, bias=False)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, -1, rms_norm_eps, bias=False)
         def _set_tp():
@@ -944,11 +944,16 @@ class MistralDecoderLayer(nn.Module):
             k = self.self_attn.num_kv_heads * hd
             v = self.self_attn.num_kv_heads * hd
             i = self.mlp.intermediate_size
-            _set(self.self_attn.qkv_proj, tp.RowSeg("_shard_qkv", rows=[q, k, v], col=h, groups=hd))
-            _set(self.self_attn.o_proj, tp.Shard1Dim("_shard_o", shape=self.self_attn.o_proj.weight.shape, axis=1))
-            _set(self.mlp.gate_up_proj, tp.RowSeg("_shard_mlp_up", rows=[i, i], col=h, groups=1))
-            _set(self.mlp.down_proj, tp.Shard1Dim("_shard_mlp_down", shape=self.mlp.down_proj.weight.shape, axis=1))
+            _set(self.self_attn.qkv_proj, tp.Shard1DimSeg("_shard_qkv", segs=[q, k, v], dim=0))
+            _set(self.self_attn.o_proj, tp.Shard1Dim("_shard_o", dim=1))
+            if config.num_local_experts == 0:
+                _set(self.mlp.gate_up_proj, tp.Shard1DimSeg("_shard_mlp_up", segs=[i, i], dim=0))
+                _set(self.mlp.down_proj, tp.Shard1Dim("_shard_mlp_down", dim=1))
+            else:
+                _set(self.mlp.e1_e3, tp.Shard1DimSeg("_shard_mlp_up", segs=[i, i], dim= 1))
+                _set(self.mlp.e2, tp.Shard1Dim("_shard_mlp_down", dim= 2))
         self.tensor_parallel_shards = config.tensor_parallel_shards
+        _set_tp()
 
     def forward(  # pylint: disable=too-many-arguments
         self,
@@ -991,7 +996,7 @@ class MistralModel(nn.Module):
             [MistralDecoderLayer(config, rotary_embedding) for _ in range(config.num_hidden_layers)]
         )
         self.norm = nn.RMSNorm(config.hidden_size, -1, config.rms_norm_eps, bias=False)
-        self.tensor_parallel_shards = config.tensor_parallel_shards > 1
+        self.tensor_parallel_shards = config.tensor_parallel_shards
 
     def forward(  # pylint: disable=too-many-arguments
         self,

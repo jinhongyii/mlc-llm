@@ -1,9 +1,9 @@
 """Mixture of Experts operators"""
 import tvm
-from tvm import tir, te, DataType
+from tvm import DataType, te, tir
+from tvm.relax.frontend.nn import Tensor, op
 from tvm.script import tir as T
 from tvm.topi.cuda.sort import topk as topi_topk
-from tvm.relax.frontend.nn import op, Tensor
 
 from mlc_chat.support import logging
 

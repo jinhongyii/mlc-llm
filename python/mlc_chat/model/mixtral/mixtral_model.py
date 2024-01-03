@@ -2,27 +2,22 @@
 Implementation for Mistral architecture.
 """
 import dataclasses
-from typing import Any, Dict, Optional
 
-import tvm
-from tvm import relax as rx
 from tvm import te, tir
 from tvm.relax.frontend import nn
 from tvm.relax.frontend.nn import Tensor, op
-from tvm.script import tir as T
 from tvm.topi.cuda.scan import inclusive_scan
+
 from mlc_chat import op as op_ext
-from mlc_chat.support import logging
-from mlc_chat.support.config import ConfigBase
-from mlc_chat.support.style import bold
-from mlc_chat.support import tensor_parallel as tp
 from mlc_chat.model.mistral.mistral_model import (
-    MistralConfig,
-    RotaryEmbedding,
     MistralAttention,
-    MistralModel,
+    MistralConfig,
     MistralForCasualLM,
+    MistralModel,
+    RotaryEmbedding,
 )
+from mlc_chat.support import logging
+from mlc_chat.support import tensor_parallel as tp
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +29,9 @@ class MixtralConfig(MistralConfig):  # pylint: disable=too-many-instance-attribu
     num_local_experts: int = 0
     num_experts_per_tok: int = 0
 
-    def __post_init__(self):
-        super().__post_init__()
 
 
-# pylint: disable=invalid-name,missing-docstring
-
+# pylint: disable=invalid-name,missing-docstring,too-many-locals,fixme
 
 class MixtralExperts(nn.Module):
     """Mixtral experts"""
@@ -69,17 +61,16 @@ class MixtralExperts(nn.Module):
                     self.num_local_experts,
                     self.dtype,
                 )
-            else:
-                return op_ext.gemv_e2(
-                    x,
-                    self.weight,
-                    indptr,
-                    self.in_features,
-                    self.out_features,
-                    self.num_experts_per_tok,
-                    self.num_local_experts,
-                    self.dtype,
-                )
+            return op_ext.gemv_e2(
+                x,
+                self.weight,
+                indptr,
+                self.in_features,
+                self.out_features,
+                self.num_experts_per_tok,
+                self.num_local_experts,
+                self.dtype,
+            )
 
         return op_ext.group_gemm(
             x,
@@ -135,8 +126,7 @@ class MixtralMoE(nn.Module):
                 )
 
             return op.tensor_expr_op(te_add, "topk_mask", args=[x])
-        else:
-            return op.sum(x, axis=1)
+        return op.sum(x, axis=1)
 
     def forward(self, x: Tensor):
         assert x.ndim == 3
@@ -209,7 +199,6 @@ class MixtralDecoderLayer(nn.Module):
             def _set(layer, hint):
                 layer.weight.attrs["shard_strategy"] = hint
 
-            h = config.hidden_size
             hd = config.head_dim
             q = self.self_attn.num_q_heads * hd
             k = self.self_attn.num_kv_heads * hd

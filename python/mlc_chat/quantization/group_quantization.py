@@ -2,18 +2,16 @@
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple
 
-import tvm
 from tvm import DataType, DataTypeCode, IRModule
 from tvm import dlight as dl
 from tvm import relax, te, tir
 from tvm.relax.frontend import nn
 from tvm.runtime import NDArray
 from tvm.target import Target
-from tvm.script import tir as T
 
-from mlc_chat.model.mixtral.mixtral_model import MixtralExperts
 from mlc_chat import op as op_ext
 from mlc_chat.loader import QuantizeMapping
+from mlc_chat.model.mixtral.mixtral_model import MixtralExperts
 from mlc_chat.support import logging
 from mlc_chat.support import tensor_parallel as tp
 
@@ -450,7 +448,7 @@ class GroupQuantizeEmbedding(nn.Module):
         )
 
 
-class GroupQuantizeMixtralExperts(nn.Module):
+class GroupQuantizeMixtralExperts(nn.Module): # pylint: disable=too-many-instance-attributes
     """An MixtralExperts module with group quantization"""
 
     def __init__(
@@ -460,7 +458,7 @@ class GroupQuantizeMixtralExperts(nn.Module):
         in_features,
         out_features,
         config: GroupQuantize,
-    ):
+    ): # pylint: disable=too-many-arguments
         self.num_local_experts = num_local_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.in_features = in_features
@@ -549,18 +547,17 @@ class GroupQuantizeMixtralExperts(nn.Module):
                     self.num_experts_per_tok,
                     self.num_local_experts,
                 )
-            else:
-                return op_ext.group_dequantize_gemv_e2(
-                    x,
-                    self.q_weight,
-                    self.q_scale,
-                    indptr,
-                    self.config,
-                    self.in_features,
-                    self.out_features,
-                    self.num_experts_per_tok,
-                    self.num_local_experts,
-                )
+            return op_ext.group_dequantize_gemv_e2(
+                x,
+                self.q_weight,
+                self.q_scale,
+                indptr,
+                self.config,
+                self.in_features,
+                self.out_features,
+                self.num_experts_per_tok,
+                self.num_local_experts,
+            )
         return op_ext.group_dequantize_group_gemm(
             x,
             self.q_weight,

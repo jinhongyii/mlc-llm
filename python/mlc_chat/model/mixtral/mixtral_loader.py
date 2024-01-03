@@ -10,7 +10,6 @@ from mlc_chat.loader import ExternMapping
 from mlc_chat.quantization import Quantization
 
 from .mixtral_model import MixtralConfig, MixtralForCasualLM
-from .mixtral_quantization import awq_quant
 
 
 def huggingface(model_config: MixtralConfig, quantization: Quantization) -> ExternMapping:

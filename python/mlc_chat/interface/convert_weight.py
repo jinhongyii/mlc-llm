@@ -104,7 +104,9 @@ def _convert_args(args: ConversionArgs) -> None:  # pylint: disable=too-many-loc
         with tqdm.redirect():
             for name, param in LOADER[args.source_format](
                 path=args.source,
-                extern_param_map=args.model.source[args.source_format](model_config, args.quantization),
+                extern_param_map=args.model.source[args.source_format](
+                    model_config, args.quantization
+                ),
                 quantize_param_map=quantize_map,
             ).load(device=args.device):
                 _check_param(name, param)

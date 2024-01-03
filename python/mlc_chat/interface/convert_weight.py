@@ -70,46 +70,47 @@ def _convert_args(args: ConversionArgs) -> None:  # pylint: disable=too-many-loc
     model, quantize_map = args.model.quantize[args.quantization.kind](
         model_config, args.quantization
     )
-    _, _named_params, _ = model.export_tvm(  # type: ignore[misc]
-        spec=model.get_default_spec(),  # type: ignore[attr-defined]
-        allow_extern=True,
-    )
-    named_params = dict(_named_params)
+    with Target.from_device(args.device):
+        _, _named_params, _ = model.export_tvm(  # type: ignore[misc]
+            spec=model.get_default_spec(),  # type: ignore[attr-defined]
+            allow_extern=True,
+        )
+        named_params = dict(_named_params)
 
-    def _check_param(name: str, param: NDArray):
-        nonlocal named_params
-        if name not in named_params:
-            raise ValueError(f"Parameter not found in model: {name}")
-        if name in param_dict:
-            raise ValueError(f"Duplication: Parameter {name} already computed")
-        expect_shape = tuple(int(x) for x in named_params[name].shape)
-        expect_dtype = named_params[name].dtype
-        actual_shape = tuple(int(x) for x in param.shape)
-        actual_dtype = param.dtype
-        if actual_shape != expect_shape:
-            raise ValueError(
-                f"Parameter {name} has shape {param.shape}, but expected {expect_shape}"
-            )
-        if actual_dtype != expect_dtype:
-            raise ValueError(
-                f"Parameter {name} has dtype {param.dtype}, but expected {expect_dtype}"
-            )
-        del named_params[name]
+        def _check_param(name: str, param: NDArray):
+            nonlocal named_params
+            if name not in named_params:
+                raise ValueError(f"Parameter not found in model: {name}")
+            if name in param_dict:
+                raise ValueError(f"Duplication: Parameter {name} already computed")
+            expect_shape = tuple(int(x) for x in named_params[name].shape)
+            expect_dtype = named_params[name].dtype
+            actual_shape = tuple(int(x) for x in param.shape)
+            actual_dtype = param.dtype
+            if actual_shape != expect_shape:
+                raise ValueError(
+                    f"Parameter {name} has shape {param.shape}, but expected {expect_shape}"
+                )
+            if actual_dtype != expect_dtype:
+                raise ValueError(
+                    f"Parameter {name} has dtype {param.dtype}, but expected {expect_dtype}"
+                )
+            del named_params[name]
 
-    # load and quantize
-    param_dict = {}
-    total_params = _calc_total_params(args.model.model(model_config))
-    total_bytes = 0.0
-    with Target.from_device(args.device), tqdm.redirect():
-        for name, param in LOADER[args.source_format](
-            path=args.source,
-            extern_param_map=args.model.source[args.source_format](model_config, args.quantization),
-            quantize_param_map=quantize_map,
-        ).load(device=args.device):
-            _check_param(name, param)
-            param = param.copyto(cpu_device())
-            param_dict[name] = param
-            total_bytes += math.prod(param.shape) * np.dtype(param.dtype).itemsize
+        # load and quantize
+        param_dict = {}
+        total_params = _calc_total_params(args.model.model(model_config))
+        total_bytes = 0.0
+        with tqdm.redirect():
+            for name, param in LOADER[args.source_format](
+                path=args.source,
+                extern_param_map=args.model.source[args.source_format](model_config, args.quantization),
+                quantize_param_map=quantize_map,
+            ).load(device=args.device):
+                _check_param(name, param)
+                param = param.copyto(cpu_device())
+                param_dict[name] = param
+                total_bytes += math.prod(param.shape) * np.dtype(param.dtype).itemsize
     if named_params:
         raise ValueError(f"Parameter not found in source: {', '.join(named_params.keys())}")
     # Log necessary statistics

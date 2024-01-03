@@ -2,13 +2,17 @@
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple
 
+import tvm
 from tvm import DataType, DataTypeCode, IRModule
 from tvm import dlight as dl
 from tvm import relax, te, tir
 from tvm.relax.frontend import nn
 from tvm.runtime import NDArray
 from tvm.target import Target
+from tvm.script import tir as T
 
+from mlc_chat.model.mixtral.mixtral_model import MixtralExperts
+from mlc_chat import op as op_ext
 from mlc_chat.loader import QuantizeMapping
 from mlc_chat.support import logging
 from mlc_chat.support import tensor_parallel as tp
@@ -110,6 +114,11 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
                     self.quant_map.param_map[weight_name] = [f"{name}.q_weight", f"{name}.q_scale"]
                     self.quant_map.map_func[weight_name] = self.config.quantize_weight
                     return GroupQuantizeEmbedding.from_embedding(node, self.config)
+                if isinstance(node, MixtralExperts):
+                    weight_name = f"{name}.weight"
+                    self.quant_map.param_map[weight_name] = [f"{name}.q_weight", f"{name}.q_scale"]
+                    self.quant_map.map_func[weight_name] = self.config.quantize_weight
+                    return GroupQuantizeMixtralExperts.from_mixtral_experts(node, self.config)
                 return self.visit(name, node)
 
         model.to(dtype=self.model_dtype)
@@ -438,6 +447,129 @@ class GroupQuantizeEmbedding(nn.Module):
         return nn.op.reshape(
             nn.op.take(w, nn.op.reshape(x, shape=[-1]), axis=0),
             shape=[*x.shape, self.dim],
+        )
+
+
+class GroupQuantizeMixtralExperts(nn.Module):
+    """An MixtralExperts module with group quantization"""
+
+    def __init__(
+        self,
+        num_local_experts,
+        num_experts_per_tok,
+        in_features,
+        out_features,
+        config: GroupQuantize,
+    ):
+        self.num_local_experts = num_local_experts
+        self.num_experts_per_tok = num_experts_per_tok
+        self.in_features = in_features
+        self.out_features = out_features
+        self.config = config
+        num_group = tir.ceildiv(in_features, config.group_size)
+        self.q_weight = nn.Parameter(
+            (num_local_experts, out_features, config.num_storage_per_group * num_group),
+            config.storage_dtype,
+        )
+        self.q_scale = nn.Parameter(
+            (num_local_experts, out_features, num_group), config.model_dtype
+        )
+        self.dtype = config.model_dtype
+
+    @staticmethod
+    def from_mixtral_experts(
+        src: "MixtralExperts", config: GroupQuantize
+    ) -> "GroupQuantizeMixtralExperts":
+        """
+        Converts a non-quantized MixtralExperts to a group quantized GroupQuantizeMixtralExperts
+
+        Parameters
+        ----------
+        src : MixtralExperts
+            The non-quantized MixtralExperts
+
+        config : GroupQuantize
+            The group quantization config.
+
+        Returns
+        -------
+        ret : GroupQuantizeMixtralExperts
+            The group quantized GroupQuantizeMixtralExperts layer.
+        """
+        quantized_mistral_experts = GroupQuantizeMixtralExperts(
+            num_local_experts=src.num_local_experts,
+            num_experts_per_tok=src.num_experts_per_tok,
+            in_features=src.in_features,
+            out_features=src.out_features,
+            config=config,
+        )
+        if "shard_strategy" in src.weight.attrs:
+            shard = src.weight.attrs["shard_strategy"]
+            _apply_sharding(shard, f"{shard.name}_q_weight", quantized_mistral_experts.q_weight)
+            _apply_sharding(shard, f"{shard.name}_q_scale", quantized_mistral_experts.q_scale)
+        return quantized_mistral_experts
+
+    def forward(
+        self, x: nn.Tensor, indptr: nn.Tensor, single_batch_decode: bool = False
+    ) -> nn.Tensor:  # pylint: disable=invalid-name
+        """
+        Forward method for group quantized mistral experts.
+
+        Parameters
+        ----------
+        x : nn.Tensor
+            The input tensor.
+
+        indptr: nn.Tensor
+            The indptr tensor
+
+        single_batch_decode: bool
+            Whether to use single-batch decode
+
+        Returns
+        -------
+        ret : nn.Tensor
+            The output tensor for the group quantized mistral experts layer.
+        """
+
+        assert x.ndim == 2
+        if single_batch_decode:
+            # single-batch decode
+            assert x.shape[1] == self.in_features
+            assert indptr.ndim == 1
+            if x.shape[0] == 1:
+                return op_ext.group_dequantize_gemv_e1_e3(
+                    x,
+                    self.q_weight,
+                    self.q_scale,
+                    indptr,
+                    self.config,
+                    self.in_features,
+                    self.out_features,
+                    self.num_experts_per_tok,
+                    self.num_local_experts,
+                )
+            else:
+                return op_ext.group_dequantize_gemv_e2(
+                    x,
+                    self.q_weight,
+                    self.q_scale,
+                    indptr,
+                    self.config,
+                    self.in_features,
+                    self.out_features,
+                    self.num_experts_per_tok,
+                    self.num_local_experts,
+                )
+        return op_ext.group_dequantize_group_gemm(
+            x,
+            self.q_weight,
+            self.q_scale,
+            indptr,
+            self.config,
+            self.in_features,
+            self.out_features,
+            self.num_local_experts,
         )
 
 

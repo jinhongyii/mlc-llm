@@ -16,7 +16,13 @@ from mlc_chat.support import logging
 from mlc_chat.support.config import ConfigBase
 from mlc_chat.support.style import bold
 from mlc_chat.support import tensor_parallel as tp
-from mlc_chat.model.mistral.mistral_model import MistralConfig, RotaryEmbedding, MistralAttention, MistralModel, MistralForCasualLM
+from mlc_chat.model.mistral.mistral_model import (
+    MistralConfig,
+    RotaryEmbedding,
+    MistralAttention,
+    MistralModel,
+    MistralForCasualLM,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +36,7 @@ class MixtralConfig(MistralConfig):  # pylint: disable=too-many-instance-attribu
 
     def __post_init__(self):
         super().__post_init__()
+
 
 # pylint: disable=invalid-name,missing-docstring
 
@@ -187,8 +194,9 @@ class MixtralMoE(nn.Module):
         )
         return weighted_sum
 
+
 class MixtralDecoderLayer(nn.Module):
-    """ Mixtral decoder layer"""
+    """Mixtral decoder layer"""
 
     def __init__(self, config: MixtralConfig, rotary_embedding: RotaryEmbedding):
         rms_norm_eps = config.rms_norm_eps
@@ -252,6 +260,7 @@ class MixtralModel(MistralModel):
         self.layers = nn.ModuleList(
             [MixtralDecoderLayer(config, rotary_embedding) for _ in range(config.num_hidden_layers)]
         )
+
 
 class MixtralForCasualLM(MistralForCasualLM):
     """Same as LlamaForCausalLM, except for the use of sliding window attention."""

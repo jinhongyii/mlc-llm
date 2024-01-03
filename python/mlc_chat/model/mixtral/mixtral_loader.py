@@ -102,20 +102,17 @@ def huggingface(model_config: MixtralConfig, quantization: Quantization) -> Exte
                 dtype=mlc_param.dtype,
             ),
         )
-        
+
         mlc_name = f"{mlc_mlp}.gate.weight"
         mlc_param = named_parameters[mlc_name]
         mapping.add_mapping(
             mlc_name,
-            [
-                f"{mlp}.gate.weight"
-            ],
+            [f"{mlp}.gate.weight"],
             functools.partial(
                 lambda x, dtype: x.astype(dtype),
                 dtype=mlc_param.dtype,
             ),
         )
-                
 
         # inv_freq is not used in the model
         mapping.add_unused(f"{attn}.rotary_emb.inv_freq")
@@ -131,4 +128,3 @@ def huggingface(model_config: MixtralConfig, quantization: Quantization) -> Exte
                 ),
             )
     return mapping
-

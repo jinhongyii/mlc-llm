@@ -30,8 +30,8 @@ class MixtralConfig(MistralConfig):  # pylint: disable=too-many-instance-attribu
     num_experts_per_tok: int = 0
 
 
-
 # pylint: disable=invalid-name,missing-docstring,too-many-locals,fixme
+
 
 class MixtralExperts(nn.Module):
     """Mixtral experts"""

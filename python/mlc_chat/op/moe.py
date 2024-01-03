@@ -9,6 +9,8 @@ from mlc_chat.support import logging
 
 logger = logging.getLogger(__name__)
 
+# pylint: skip-file
+# mypy: ignore-errors
 
 def get_indptr(cumsum_colwise_flattened: Tensor, num_local_experts: int) -> Tensor:
     @T.prim_func

@@ -448,7 +448,7 @@ class GroupQuantizeEmbedding(nn.Module):
         )
 
 
-class GroupQuantizeMixtralExperts(nn.Module): # pylint: disable=too-many-instance-attributes
+class GroupQuantizeMixtralExperts(nn.Module):  # pylint: disable=too-many-instance-attributes
     """An MixtralExperts module with group quantization"""
 
     def __init__(
@@ -458,7 +458,7 @@ class GroupQuantizeMixtralExperts(nn.Module): # pylint: disable=too-many-instanc
         in_features,
         out_features,
         config: GroupQuantize,
-    ): # pylint: disable=too-many-arguments
+    ):  # pylint: disable=too-many-arguments
         self.num_local_experts = num_local_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.in_features = in_features

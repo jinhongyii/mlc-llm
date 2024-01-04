@@ -139,7 +139,7 @@ class MixtralMoE(nn.Module):
         expert_weights, expert_indices = op_ext.topk(
             gate, self.num_experts_per_tok, self.num_local_experts, self.dtype, "int32"
         )
-        expert_weights = op.softmax(expert_weights, axis=-1)
+        expert_weights = op.softmax(expert_weights.astype("float32"), axis=-1).astype(self.dtype)
         if num_tokens == 1:
             # single batch decode
             expert_indices = op.reshape(expert_indices, (self.num_experts_per_tok,))

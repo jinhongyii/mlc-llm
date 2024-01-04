@@ -11,7 +11,7 @@ from tvm.target import Target
 
 from mlc_chat import op as op_ext
 from mlc_chat.loader import QuantizeMapping
-from mlc_chat.model.mixtral.mixtral_model import MixtralExperts
+from mlc_chat.nn.expert import MixtralExperts
 from mlc_chat.support import logging
 from mlc_chat.support import tensor_parallel as tp
 

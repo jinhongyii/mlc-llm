@@ -1,5 +1,7 @@
+""" MoE expert nn module"""
+
 from tvm.relax.frontend import nn
-from tvm.relax.frontend.nn import Tensor, op
+from tvm.relax.frontend.nn import Tensor
 
 from mlc_chat import op as op_ext
 
@@ -15,7 +17,9 @@ class MixtralExperts(nn.Module):
         self.weight = nn.Parameter((num_local_experts, out_features, in_features))
         self.dtype = "float32"
 
-    def forward(self, x: Tensor, indptr: Tensor, single_batch_decode: bool = False):
+    def forward(
+        self, x: Tensor, indptr: Tensor, single_batch_decode: bool = False
+    ):  # pylint: disable=missing-function-docstring
         assert x.ndim == 2
         if single_batch_decode:
             # single-batch decode

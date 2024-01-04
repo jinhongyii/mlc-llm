@@ -33,6 +33,7 @@ class MixtralConfig(MistralConfig):  # pylint: disable=too-many-instance-attribu
 
 # pylint: disable=invalid-name,missing-docstring,too-many-locals,fixme
 
+
 class MixtralMoE(nn.Module):
     """Mixture of experts"""
 

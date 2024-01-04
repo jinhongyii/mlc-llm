@@ -370,7 +370,7 @@ def group_gemm(
                 cur_tile_cnt[0] = bx
                 row[0] = 0
         
-                while cur_e[0] < Ne:
+                while T.tvm_thread_invariant(cur_e[0] < Ne):
                     # move to the current group
                     while cur_tile_cnt[0] >= sum[1] and cur_e[0] < Ne:
                         cur_e[0] += 1
@@ -385,7 +385,7 @@ def group_gemm(
                     # sync threads to make sure all threads have the same tile position
                     T.evaluate(T.Call(None, "tir.tvm_storage_sync", tvm.runtime.convert(["shared"])))
                     
-                    if (cur_e[0] < Ne):
+                    if T.tvm_thread_invariant(cur_e[0] < Ne):
                         # fetch current tile position
                         a: T.int32 = cur_e[0]
                         delta: T.int32 = indptr[a + 1] - indptr[a]
@@ -665,7 +665,7 @@ def group_dequantize_group_gemm(
                 cur_tile_cnt[0] = bx
                 row[0] = 0
         
-                while cur_e[0] < Ne:
+                while T.tvm_thread_invariant(cur_e[0] < Ne):
                     # move to the current group
                     while cur_tile_cnt[0] >= sum[1] and cur_e[0] < Ne:
                         cur_e[0] += 1
@@ -680,7 +680,7 @@ def group_dequantize_group_gemm(
                     # sync threads to make sure all threads have the same tile position
                     T.evaluate(T.Call(None, "tir.tvm_storage_sync", tvm.runtime.convert(["shared"])))
                     
-                    if (cur_e[0] < Ne):
+                    if T.tvm_thread_invariant(cur_e[0] < Ne):
                         # fetch current tile position
                         a: T.int32 = cur_e[0]
                         delta: T.int32 = indptr[a + 1] - indptr[a]
